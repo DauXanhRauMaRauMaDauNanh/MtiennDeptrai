@@ -53,9 +53,38 @@ do
 	Env.hasList      = (type(listfiles) == "function")
 	Env.hasMakeDir   = (type(makefolder) == "function")
 	Env.hasRequest   = (type(request) == "function") or (type(http_request) == "function") or (type(syn) == "table" and type(syn.request) == "function")
-	Env.hasHookMeta  = (type(hookmetamethod) == "function")
-	Env.hasNamecall  = (type(getrawmetatable) == "function")
-	Env.hasClipboard = (type(setclipboard) == "function")
+	Env.hasHookMeta    = (type(hookmetamethod) == "function")
+	Env.hasNamecall    = (type(getrawmetatable) == "function")
+	Env.hasClipboard   = (type(setclipboard) == "function")
+	Env.hasCustomAsset = (type(getcustomasset) == "function") or (type(getsynasset) == "function")
+
+	local _assetCache = {}
+	function Env.getCustomAsset(url, cachePath)
+		if _assetCache[cachePath] then return _assetCache[cachePath] end
+		local resolver = (type(getcustomasset) == "function" and getcustomasset)
+			or (type(getsynasset) == "function" and getsynasset)
+			or nil
+		if not resolver or not Env.hasFile then return nil end
+		local ok, asset = pcall(function()
+			Env.mkdir("MtiennDeptrai")
+			local existing = Env.read(cachePath)
+			if not existing or #existing < 128 then
+				local body = game:HttpGet(url, true)
+				if type(body) == "string" and #body >= 128 then
+					Env.write(cachePath, body)
+				end
+			end
+			if Env.read(cachePath) then
+				return resolver(cachePath)
+			end
+			return nil
+		end)
+		if ok and type(asset) == "string" and #asset > 0 then
+			_assetCache[cachePath] = asset
+			return asset
+		end
+		return nil
+	end
 
 	function Env.write(path, data)
 		if Env.hasFile then pcall(writefile, path, data) end
@@ -148,8 +177,10 @@ end
 
 -- Global namespace shared across all parts
 local Hub = {
-	Version   = "1.0.0",
+	Version   = "2.0.0",
 	Name      = "MtiennDeptrai Hub",
+	LogoUrl   = "https://raw.githubusercontent.com/DauXanhRauMaRauMaDauNanh/MtiennDeptrai/main/logo.png",
+	LogoPath  = "MtiennDeptrai/logo_v2.png",
 	Env       = Env,
 	safe      = safe,
 	fmt       = fmt,
@@ -165,6 +196,20 @@ local Hub = {
 	_connections = {},
 	_heartbeats = {},
 }
+
+function Hub.LoadLogoImage(imgLabel, fallbackObj)
+	if not imgLabel or not Env.hasCustomAsset then return end
+	task.spawn(function()
+		local asset = Env.getCustomAsset(Hub.LogoUrl, Hub.LogoPath)
+		if asset and imgLabel and imgLabel.Parent then
+			pcall(function()
+				imgLabel.Image = asset
+				imgLabel.Visible = true
+				if fallbackObj then fallbackObj.Visible = false end
+			end)
+		end
+	end)
+end
 
 function Hub.trackConnection(conn)
 	table.insert(Hub._connections, conn)
@@ -209,11 +254,26 @@ local Config = {
 	UiKeybind        = "RightShift",
 	NotifyEnabled    = true,
 
-	-- In-Match: Auto Play
+	-- In-Match: Auto Play & Smart Defense
 	AutoVoteStart       = false,
 	AutoSkipWave        = false,
+	AutoPlace           = false,
+	PlaceZone           = "Mid Curve (Góc cua)", -- Mid Curve (Góc cua) | Spawn Camp (Đầu đường) | Base Guard (Thủ nhà) | Around Player (Quanh mình) | Saved Spot (Tọa độ lưu)
+	PlaceSlots          = { "1", "2", "3", "4" },
+	FarmSlots           = { "5", "6" },
+	HillSlots           = {},
+	MaxUnitsPerSlot     = 3,
+	PlaceSpacing        = 3.8,
+	PlaceRoadOffset     = 8.5,
+	PlaceStartWave      = 1,
+	PlaceDelay          = 1.2,
+	SavedGroundPos      = nil,
+	SavedHillPos        = nil,
 	AutoUpgrade         = false,
-	UpgradeStrategy     = "Cheapest First", -- Cheapest First | Highest Cost | Farm First | All
+	UpgradeStrategy     = "Smart Economy",  -- Smart Economy | Balanced Level | Carry First | Farm First | Cheapest First | Highest Cost | All
+	MaxUpgradeLevel     = 0,                -- 0 = unlimited
+	ReserveYen          = 0,                -- reserve Yen for placing before upgrading
+	AutoSellFarmsWave   = 0,                -- 0 = off
 	AutoAbility         = false,
 	AbilityDelay        = 15.5,
 	AbilityUnits        = {},               -- list of unit names/ids for buff chain
@@ -620,30 +680,358 @@ do
 		end
 		return nil
 	end
+
+	-- ------------------------------------------------- Smart Defense / Placement API
+	local FARM_KEYWORDS = { "bulma", "speedwagon", "takaroda", "farm", "money", "merchant", "idol", "oshi", "nami", "milo" }
+	function GameAPI.isFarmUnitName(name)
+		local s = string.lower(tostring(name or ""))
+		for _, kw in ipairs(FARM_KEYWORDS) do
+			if string.find(s, kw, 1, true) then return true end
+		end
+		return false
+	end
+
+	function GameAPI.isUnitMaxed(model)
+		local ok, res = pcall(function()
+			local stats = model:FindFirstChild("_stats")
+			if not stats then return false end
+			local up = stats:FindFirstChild("upgrade")
+			local maxUp = stats:FindFirstChild("max_upgrade") or stats:FindFirstChild("max_upgrades")
+			if up and maxUp and tonumber(up.Value) and tonumber(maxUp.Value) and tonumber(maxUp.Value) > 0 then
+				return tonumber(up.Value) >= tonumber(maxUp.Value)
+			end
+			local uc = stats:FindFirstChild("upgrade_cost")
+			if uc and (uc.Value == nil or tostring(uc.Value) == "MAX" or tonumber(uc.Value) == -1) then
+				return true
+			end
+			return false
+		end)
+		return ok and res == true
+	end
+
+	-- Read equipped hotbar slots (1..6) from PlayerGui.spawn_units.Lives.Frame.Units
+	function GameAPI.getEquippedSlots()
+		local slots = {}
+		pcall(function()
+			local pg = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
+			local su = pg and pg:FindFirstChild("spawn_units")
+			local lives = su and su:FindFirstChild("Lives")
+			local frame = lives and lives:FindFirstChild("Frame")
+			local unitsFrame = frame and frame:FindFirstChild("Units")
+			if not unitsFrame then return end
+
+			local function parseNum(txt)
+				local clean = tostring(txt or ""):gsub("[^%d]", "")
+				return tonumber(clean) or 0
+			end
+
+			for idx = 1, 6 do
+				local slotBtn = unitsFrame:FindFirstChild(tostring(idx))
+				if slotBtn then
+					local nameLbl = slotBtn:FindFirstChild("name")
+					local uname = nameLbl and tostring(nameLbl.Text or "") or ""
+					local unitVal = slotBtn:FindFirstChild("unit")
+					local unitObj = unitVal and unitVal.Value or nil
+					local uuid = nil
+					if unitObj then
+						pcall(function()
+							uuid = unitObj:GetAttribute("uuid") or unitObj:GetAttribute("UUID")
+						end)
+						if not uuid then
+							local uv = unitObj:FindFirstChild("uuid")
+							if uv and uv.Value then uuid = tostring(uv.Value) end
+						end
+						if not uuid and unitObj.Name ~= "" then
+							uuid = unitObj.Name
+						end
+						if uname == "" then uname = unitObj.Name end
+					end
+					if not uuid then
+						pcall(function()
+							uuid = slotBtn:GetAttribute("uuid") or slotBtn:GetAttribute("UUID")
+						end)
+					end
+
+					local cost = 0
+					local costFolder = slotBtn:FindFirstChild("Cost")
+					local costText = costFolder and costFolder:FindFirstChild("text")
+					if costText and costText.Text then
+						cost = parseNum(costText.Text)
+					else
+						local costLbl = slotBtn:FindFirstChild("cost")
+						if costLbl and costLbl.Text then cost = parseNum(costLbl.Text) end
+					end
+
+					local placed, maxPlace = 0, 0
+					local plLbl = slotBtn:FindFirstChild("placement_text")
+					if plLbl and plLbl.Text then
+						local a, b = string.match(tostring(plLbl.Text), "(%d+)%s*/%s*(%d+)")
+						placed = tonumber(a) or 0
+						maxPlace = tonumber(b) or 0
+					end
+
+					local lockedObj = slotBtn:FindFirstChild("locked")
+					local isLocked = lockedObj and lockedObj.Visible == true
+					if (uuid or uname ~= "") and not isLocked then
+						table.insert(slots, {
+							slot     = tostring(idx),
+							index    = idx,
+							name     = (uname ~= "" and uname) or tostring(uuid),
+							uuid     = uuid or uname,
+							cost     = cost,
+							placed   = placed,
+							maxPlace = maxPlace > 0 and maxPlace or 4,
+							isFarm   = GameAPI.isFarmUnitName(uname),
+						})
+					end
+				end
+			end
+		end)
+		return slots
+	end
+
+	-- Collect ordered enemy lane waypoints from Workspace._BASES
+	function GameAPI.getPathWaypoints()
+		local pts = {}
+		pcall(function()
+			local bases = Workspace:FindFirstChild("_BASES")
+			if not bases then return end
+			local lanesFolder
+			for _, side in ipairs({ "pve", "player" }) do
+				local s = bases:FindFirstChild(side)
+				local lf = s and s:FindFirstChild("LANES")
+				if lf and #lf:GetChildren() > 0 then
+					lanesFolder = lf
+					break
+				end
+			end
+			if not lanesFolder then return end
+
+			local lane = lanesFolder:FindFirstChild("1") or lanesFolder:GetChildren()[1]
+			if not lane then return end
+
+			local numbered = {}
+			local spawnPt, finalPt = nil, nil
+			for _, child in ipairs(lane:GetChildren()) do
+				local pos
+				pcall(function()
+					if child:IsA("BasePart") then pos = child.Position
+					elseif child:IsA("Model") then pos = child:GetPivot().Position end
+				end)
+				if pos then
+					local lname = string.lower(child.Name)
+					local num = tonumber(child.Name)
+					if lname == "spawn" then spawnPt = pos
+					elseif lname == "final" or lname == "end" then finalPt = pos
+					elseif num then table.insert(numbered, { n = num, pos = pos }) end
+				end
+			end
+			table.sort(numbered, function(a, b) return a.n < b.n end)
+			if spawnPt then table.insert(pts, spawnPt) end
+			for _, item in ipairs(numbered) do table.insert(pts, item.pos) end
+			if finalPt then table.insert(pts, finalPt) end
+		end)
+
+		-- Fallback: use player base position if no lane parts exist
+		if #pts == 0 then
+			pcall(function()
+				local bases = Workspace:FindFirstChild("_BASES")
+				local pbase = bases and bases:FindFirstChild("player") and bases.player:FindFirstChild("base")
+				if pbase then
+					local pos = pbase:IsA("Model") and pbase:GetPivot().Position or pbase.Position
+					if pos then table.insert(pts, pos) end
+				end
+			end)
+		end
+		return pts
+	end
+
+	-- Compute optimal defense anchor Vector3 & path direction for the chosen zone
+	function GameAPI.computeDefenseAnchor(zone, savedPos)
+		if zone == "Saved Spot (Tọa độ lưu)" and type(savedPos) == "table" and savedPos.x then
+			return Vector3.new(savedPos.x, savedPos.y, savedPos.z), Vector3.new(1, 0, 0)
+		end
+		if zone == "Around Player (Quanh mình)" then
+			local ok, pos = pcall(function()
+				return LocalPlayer.Character and LocalPlayer.Character:GetPivot().Position
+			end)
+			if ok and pos then return pos, Vector3.new(1, 0, 0) end
+		end
+
+		local pts = GameAPI.getPathWaypoints()
+		if #pts >= 3 then
+			if zone == "Spawn Camp (Đầu đường)" then
+				local idx = math.max(1, math.min(#pts - 1, math.floor(#pts * 0.18) + 1))
+				local dir = (pts[idx + 1] - pts[idx])
+				dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(1, 0, 0)
+				return pts[idx], dir
+			elseif zone == "Base Guard (Thủ nhà)" then
+				local idx = math.max(2, math.min(#pts, math.floor(#pts * 0.85)))
+				local dir = (pts[idx] - pts[idx - 1])
+				dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(1, 0, 0)
+				return pts[idx], dir
+			else
+				-- "Mid Curve (Góc cua)": find sharpest bend along path (minimum dot product)
+				local bestIdx = math.max(2, math.floor(#pts * 0.45))
+				local bestDot = 2
+				for i = 2, #pts - 1 do
+					local d1 = pts[i] - pts[i - 1]
+					local d2 = pts[i + 1] - pts[i]
+					if d1.Magnitude > 1 and d2.Magnitude > 1 then
+						local dt = d1.Unit:Dot(d2.Unit)
+						if dt < bestDot then
+							bestDot = dt
+							bestIdx = i
+						end
+					end
+				end
+				local dir = pts[bestIdx + 1] - pts[bestIdx - 1]
+				dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(1, 0, 0)
+				return pts[bestIdx], dir
+			end
+		elseif #pts >= 1 then
+			return pts[1], Vector3.new(1, 0, 0)
+		end
+
+		-- Last fallback: character position
+		local ok, pos = pcall(function()
+			return LocalPlayer.Character and LocalPlayer.Character:GetPivot().Position
+		end)
+		if ok and pos then return pos, Vector3.new(1, 0, 0) end
+		return nil, Vector3.new(1, 0, 0)
+	end
+
+	-- Find a collision-free, ground/hill-snapped CFrame near anchorPos
+	function GameAPI.findPlacementSpot(anchorPos, opts)
+		if not anchorPos then return nil end
+		opts = opts or {}
+		local spacing    = opts.spacing or 3.8
+		local roadOffset = opts.roadOffset or 8.5
+		local isHill     = opts.isHill == true
+		local isFarm     = opts.isFarm == true
+		local dir        = opts.pathDir or Vector3.new(1, 0, 0)
+		local existing   = opts.existingUnits or {}
+		local waypoints  = opts.waypoints or {}
+
+		-- Perpendicular horizontal vector to enemy path
+		local flatDir = Vector3.new(dir.X, 0, dir.Z)
+		if flatDir.Magnitude < 0.05 then flatDir = Vector3.new(1, 0, 0) else flatDir = flatDir.Unit end
+		local right = Vector3.new(-flatDir.Z, 0, flatDir.X)
+
+		-- Pre-extract placed unit positions
+		local taken = {}
+		for _, u in ipairs(existing) do
+			local cf = GameAPI.getUnitPosition(u.model)
+			if cf then table.insert(taken, cf.Position) end
+		end
+
+		local function isTooCloseToUnits(p)
+			for _, t in ipairs(taken) do
+				local dx, dz = p.X - t.X, p.Z - t.Z
+				if (dx * dx + dz * dz) < (spacing * spacing) then return true end
+			end
+			return false
+		end
+
+		local function isOnRoad(p)
+			if isFarm or isHill then return false end
+			local minRoadDist = math.max(3.5, roadOffset * 0.5)
+			for _, wp in ipairs(waypoints) do
+				local dx, dz = p.X - wp.X, p.Z - wp.Z
+				if (dx * dx + dz * dz) < (minRoadDist * minRoadDist) then return true end
+			end
+			return false
+		end
+
+		-- Raycast helper (safe even in non-Roblox smoke environments)
+		local rcParams = nil
+		pcall(function()
+			rcParams = RaycastParams.new()
+			rcParams.FilterType = Enum.RaycastFilterType.Exclude
+			local excl = {}
+			if Workspace:FindFirstChild("_UNITS") then table.insert(excl, Workspace._UNITS) end
+			if Workspace:FindFirstChild("_DEAD_UNITS") then table.insert(excl, Workspace._DEAD_UNITS) end
+			if LocalPlayer and LocalPlayer.Character then table.insert(excl, LocalPlayer.Character) end
+			rcParams.FilterDescendantsInstances = excl
+		end)
+
+		local function snapSurface(candidate)
+			local ok, hit = pcall(function()
+				if type(Workspace.Raycast) ~= "function" then return nil end
+				local origin = Vector3.new(candidate.X, anchorPos.Y + (isHill and 40 or 18), candidate.Z)
+				return Workspace:Raycast(origin, Vector3.new(0, isHill and -70 or -45, 0), rcParams)
+			end)
+			if ok and hit and hit.Position then
+				local instName = string.lower(tostring(hit.Instance and hit.Instance.Name or ""))
+				-- Avoid road boundary / water / invisible barrier
+				if string.find(instName, "road", 1, true) or string.find(instName, "barrier", 1, true) then
+					return nil
+				end
+				if isHill then
+					local elevated = (hit.Position.Y >= anchorPos.Y + 2.8)
+					local hillNamed = string.find(instName, "hill", 1, true) or string.find(instName, "cliff", 1, true) or string.find(instName, "platform", 1, true)
+					if not elevated and not hillNamed then return nil end
+				else
+					-- Ground: stay near anchor elevation
+					if math.abs(hit.Position.Y - anchorPos.Y) > 6 then return nil end
+				end
+				return hit.Position
+			end
+			-- Fallback without raycast (e.g. smoke test or flat map)
+			if isHill then return nil end
+			return Vector3.new(candidate.X, anchorPos.Y, candidate.Z)
+		end
+
+		-- Build candidate spiral around anchorPos (farms further back, DPS right beside curve)
+		local baseDist = isFarm and (roadOffset + 12) or roadOffset
+		local radii = isHill and { 6, 12, 18, 24, 32, 40 } or { baseDist, baseDist + spacing, baseDist + spacing * 2, baseDist + spacing * 3 }
+		local angles = { 0, math.pi, math.pi * 0.25, -math.pi * 0.25, math.pi * 0.75, -math.pi * 0.75, math.pi * 0.5, -math.pi * 0.5, math.pi * 0.125, -math.pi * 0.125, math.pi * 0.375, -math.pi * 0.375 }
+
+		for _, r in ipairs(radii) do
+			for _, ang in ipairs(angles) do
+				local offset = right * (math.cos(ang) * r) + flatDir * (math.sin(ang) * r)
+				local rawPos = Vector3.new(anchorPos.X + offset.X, anchorPos.Y, anchorPos.Z + offset.Z)
+				if not isTooCloseToUnits(rawPos) and not isOnRoad(rawPos) then
+					local snapped = snapSurface(rawPos)
+					if snapped and not isTooCloseToUnits(snapped) then
+						return CFrame.new(snapped.X, snapped.Y, snapped.Z)
+					end
+				end
+			end
+		end
+
+		-- Fallback: direct offset right beside anchor
+		local fb = anchorPos + right * baseDist
+		return CFrame.new(fb.X, fb.Y, fb.Z)
+	end
 end
 
 -- >>>>>>>>>> part_03_ui_core.lua <<<<<<<<<<
 -- ============================================================================
--- PART 3: MtiennUI FRAMEWORK (zero-dependency, Obsidian-Indigo-Emerald theme)
+-- PART 3: MtiennUI FRAMEWORK v2.0 (Obsidian Royal VIP — Gold + Electric Cyan)
 -- ============================================================================
 local Theme = {
-	Bg        = Color3.fromRGB(13, 15, 22),
-	Sidebar   = Color3.fromRGB(18, 20, 30),
-	Panel     = Color3.fromRGB(24, 27, 40),
-	Element   = Color3.fromRGB(31, 35, 52),
-	ElementHi = Color3.fromRGB(39, 44, 66),
-	Accent    = Color3.fromRGB(99, 102, 241),
-	Accent2   = Color3.fromRGB(168, 85, 247),
+	Bg        = Color3.fromRGB(9, 11, 18),
+	BgAlt     = Color3.fromRGB(13, 16, 26),
+	Sidebar   = Color3.fromRGB(12, 15, 24),
+	Panel     = Color3.fromRGB(17, 21, 34),
+	Element   = Color3.fromRGB(23, 28, 45),
+	ElementHi = Color3.fromRGB(32, 40, 63),
+	Accent    = Color3.fromRGB(56, 189, 248),  -- Electric Cyan (matches logo)
+	Accent2   = Color3.fromRGB(129, 140, 248), -- Royal Indigo
+	Gold      = Color3.fromRGB(245, 185, 66),  -- Brushed Royal Gold (VIP)
+	GoldDim   = Color3.fromRGB(168, 122, 38),
 	Success   = Color3.fromRGB(52, 211, 153),
 	Warning   = Color3.fromRGB(251, 191, 36),
 	Danger    = Color3.fromRGB(248, 113, 113),
-	Text      = Color3.fromRGB(241, 245, 249),
+	Text      = Color3.fromRGB(244, 247, 252),
 	TextDim   = Color3.fromRGB(148, 163, 184),
-	Stroke    = Color3.fromRGB(45, 48, 62),
+	Stroke    = Color3.fromRGB(38, 46, 70),
+	StrokeHi  = Color3.fromRGB(64, 82, 122),
 }
 Hub.Theme = Theme
 
-local UI = { Tabs = {}, _elements = {}, _toasts = {} }
+local UI = { Tabs = {}, _elements = {}, _toasts = {}, _openDropdown = nil }
 Hub.UI = UI
 
 local TweenService = TweenService
@@ -664,6 +1052,14 @@ local function stroke(o, col, th, tr)
 	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 	s.Parent = o
 	return s
+end
+
+local function gradient(o, colA, colB, rot)
+	local g = Instance.new("UIGradient")
+	g.Color = ColorSequence.new(colA, colB)
+	g.Rotation = rot or 0
+	g.Parent = o
+	return g
 end
 
 local function pad(o, t, r, b, l)
@@ -709,6 +1105,13 @@ local function fireCallback(cb, ...)
 	if not ok then warn("[MtiennDeptrai] UI callback error: " .. tostring(err)) end
 end
 
+local function closeOpenDropdown(exceptFn)
+	if UI._openDropdown and UI._openDropdown ~= exceptFn then
+		pcall(UI._openDropdown)
+		UI._openDropdown = nil
+	end
+end
+
 -- ============================================================ GUI CONTAINER
 local gui = Instance.new("ScreenGui")
 gui.Name = "MtiennDeptraiHub"
@@ -720,190 +1123,332 @@ gui.Parent = Env.getGuiParent()
 UI.Gui = gui
 
 -- ------------------------------------------------------------- Main window
+local WIN_W, WIN_H = 900, 590
 local window = Instance.new("Frame")
 window.Name = "Window"
 window.AnchorPoint = Vector2.new(0.5, 0.5)
 window.Position = UDim2.fromScale(0.5, 0.5)
-window.Size = UDim2.fromOffset(880, 580)
+window.Size = UDim2.fromOffset(WIN_W, WIN_H)
 window.BackgroundColor3 = Theme.Bg
 window.BorderSizePixel = 0
 window.ClipsDescendants = true
+window.Visible = false -- revealed cleanly after Splash completes
 window.Parent = gui
-corner(window, 14)
-stroke(window, Theme.Stroke, 1.5)
+corner(window, 16)
+local winStroke = stroke(window, Theme.Gold, 1.5, 0.35)
+gradient(winStroke, Theme.Gold, Theme.Accent, 35)
+gradient(window, Color3.fromRGB(14, 18, 30), Theme.Bg, 90)
 UI.Window = window
 
--- subtle accent gradient strip on top
+-- Luminous Gold -> Cyan top crown strip
 local accentBar = Instance.new("Frame")
+accentBar.Name = "AccentBar"
 accentBar.Size = UDim2.new(1, 0, 0, 3)
-accentBar.BackgroundColor3 = Theme.Accent
+accentBar.BackgroundColor3 = Color3.new(1, 1, 1)
 accentBar.BorderSizePixel = 0
 accentBar.Parent = window
-local barGrad = Instance.new("UIGradient")
-barGrad.Color = ColorSequence.new(Theme.Accent, Theme.Accent2)
-barGrad.Rotation = 0
-barGrad.Parent = accentBar
+gradient(accentBar, Theme.Gold, Theme.Accent, 0)
 
 -- ------------------------------------------------------------- Title bar
 local titleBar = Instance.new("Frame")
 titleBar.Name = "TitleBar"
-titleBar.Size = UDim2.new(1, 0, 0, 52)
+titleBar.Size = UDim2.new(1, 0, 0, 60)
 titleBar.Position = UDim2.fromOffset(0, 3)
-titleBar.BackgroundTransparency = 1
+titleBar.BackgroundColor3 = Theme.BgAlt
+titleBar.BackgroundTransparency = 0.25
+titleBar.BorderSizePixel = 0
 titleBar.Parent = window
 
-local logo = Instance.new("Frame")
-logo.Size = UDim2.fromOffset(34, 34)
-logo.Position = UDim2.fromOffset(16, 9)
-logo.BackgroundColor3 = Theme.Accent
-logo.Parent = titleBar
-corner(logo, 10)
-local logoGrad = Instance.new("UIGradient")
-logoGrad.Color = ColorSequence.new(Theme.Accent, Theme.Accent2)
-logoGrad.Rotation = 45
-logoGrad.Parent = logo
-local logoText = label(logo, "M", 20, Theme.Text, Enum.Font.GothamBlack, Enum.TextXAlignment.Center)
+local titleLine = Instance.new("Frame")
+titleLine.Size = UDim2.new(1, 0, 0, 1)
+titleLine.Position = UDim2.new(0, 0, 1, -1)
+titleLine.BackgroundColor3 = Theme.Stroke
+titleLine.BorderSizePixel = 0
+titleLine.Parent = titleBar
 
-local titleLabel = label(titleBar, Hub.Name, 16, Theme.Text, Enum.Font.GothamBold)
-titleLabel.Position = UDim2.fromOffset(60, 6)
-titleLabel.Size = UDim2.fromOffset(220, 22)
+-- VIP Logo Crest (40x40) with generated logo.png + fallback monogram
+local logoFrame = Instance.new("Frame")
+logoFrame.Name = "LogoCrest"
+logoFrame.Size = UDim2.fromOffset(40, 40)
+logoFrame.Position = UDim2.fromOffset(16, 10)
+logoFrame.BackgroundColor3 = Theme.Element
+logoFrame.ClipsDescendants = true
+logoFrame.Parent = titleBar
+corner(logoFrame, 11)
+local logoStroke = stroke(logoFrame, Theme.Gold, 1.4, 0.15)
+gradient(logoStroke, Theme.Gold, Theme.Accent, 45)
+gradient(logoFrame, Color3.fromRGB(24, 34, 62), Color3.fromRGB(12, 16, 28), 45)
 
-local subtitle = label(titleBar, "Anime Adventures  •  v" .. Hub.Version, 11, Theme.TextDim)
-subtitle.Position = UDim2.fromOffset(60, 27)
-subtitle.Size = UDim2.fromOffset(260, 16)
+local logoFallback = label(logoFrame, "M", 22, Theme.Gold, Enum.Font.GothamBlack, Enum.TextXAlignment.Center)
+logoFallback.Size = UDim2.fromScale(1, 1)
 
--- Search bar
+local logoImg = Instance.new("ImageLabel")
+logoImg.Name = "LogoImage"
+logoImg.Size = UDim2.fromScale(1, 1)
+logoImg.BackgroundTransparency = 1
+logoImg.ScaleType = Enum.ScaleType.Crop
+logoImg.Visible = false
+logoImg.Parent = logoFrame
+corner(logoImg, 11)
+Hub.LoadLogoImage(logoImg, logoFallback)
+
+local titleLabel = label(titleBar, Hub.Name, 16, Theme.Text, Enum.Font.GothamBlack)
+titleLabel.Position = UDim2.fromOffset(66, 9)
+titleLabel.Size = UDim2.fromOffset(168, 22)
+
+-- Gold VIP Pill Badge
+local vipBadge = Instance.new("Frame")
+vipBadge.Name = "VipBadge"
+vipBadge.Size = UDim2.fromOffset(40, 18)
+vipBadge.Position = UDim2.fromOffset(238, 11)
+vipBadge.BackgroundColor3 = Theme.Gold
+vipBadge.BorderSizePixel = 0
+vipBadge.Parent = titleBar
+corner(vipBadge, 5)
+gradient(vipBadge, Theme.Gold, Color3.fromRGB(255, 220, 120), 0)
+local vipText = label(vipBadge, "VIP", 10, Theme.Bg, Enum.Font.GothamBlack, Enum.TextXAlignment.Center)
+vipText.Size = UDim2.fromScale(1, 1)
+
+local subtitle = label(titleBar, "Anime Adventures  •  v" .. Hub.Version .. "  •  Obsidian Edition", 11, Theme.TextDim, Enum.Font.GothamMedium)
+subtitle.Position = UDim2.fromOffset(66, 33)
+subtitle.Size = UDim2.fromOffset(290, 16)
+
+-- Search bar container with clear button
+local searchWrap = Instance.new("Frame")
+searchWrap.Name = "SearchWrap"
+searchWrap.Size = UDim2.fromOffset(216, 32)
+searchWrap.Position = UDim2.new(1, -310, 0, 14)
+searchWrap.BackgroundColor3 = Theme.Element
+searchWrap.BorderSizePixel = 0
+searchWrap.Parent = titleBar
+corner(searchWrap, 9)
+local searchStroke = stroke(searchWrap, Theme.Stroke, 1)
+
 local searchBox = Instance.new("TextBox")
-searchBox.Size = UDim2.fromOffset(190, 30)
-searchBox.Position = UDim2.new(1, -290, 0, 11)
-searchBox.BackgroundColor3 = Theme.Element
+searchBox.Name = "SearchBox"
+searchBox.Size = UDim2.new(1, -28, 1, 0)
+searchBox.Position = UDim2.fromOffset(0, 0)
+searchBox.BackgroundTransparency = 1
 searchBox.PlaceholderText = "🔍  Search features..."
 searchBox.PlaceholderColor3 = Theme.TextDim
 searchBox.Text = ""
 searchBox.TextColor3 = Theme.Text
 searchBox.TextSize = 12
 searchBox.Font = Enum.Font.Gotham
+searchBox.TextXAlignment = Enum.TextXAlignment.Left
 searchBox.ClearTextOnFocus = false
-searchBox.Parent = titleBar
-corner(searchBox, 8)
-stroke(searchBox, Theme.Stroke, 1)
-pad(searchBox, 0, 8, 0, 10)
+searchBox.Parent = searchWrap
+pad(searchBox, 0, 4, 0, 10)
 
--- Window buttons (minimize / close)
-local function windowButton(text, xOffset, color)
+local searchClear = Instance.new("TextButton")
+searchClear.Size = UDim2.fromOffset(24, 24)
+searchClear.Position = UDim2.new(1, -26, 0.5, -12)
+searchClear.BackgroundTransparency = 1
+searchClear.Text = "✕"
+searchClear.TextSize = 11
+searchClear.Font = Enum.Font.GothamBold
+searchClear.TextColor3 = Theme.TextDim
+searchClear.Visible = false
+searchClear.Parent = searchWrap
+searchClear.MouseButton1Click:Connect(function()
+	searchBox.Text = ""
+end)
+searchBox.Focused:Connect(function()
+	tween(searchStroke, { Color = Theme.Accent }, 0.15)
+end)
+searchBox.FocusLost:Connect(function()
+	tween(searchStroke, { Color = Theme.Stroke }, 0.15)
+end)
+
+-- Window action buttons (minimize / close)
+local function windowButton(text, xOffset, hoverBg, hoverTxt)
 	local b = Instance.new("TextButton")
-	b.Size = UDim2.fromOffset(30, 30)
-	b.Position = UDim2.new(1, xOffset, 0, 11)
-	b.BackgroundTransparency = 1
+	b.Size = UDim2.fromOffset(32, 32)
+	b.Position = UDim2.new(1, xOffset, 0, 14)
+	b.BackgroundColor3 = Theme.Element
+	b.BackgroundTransparency = 0.35
 	b.Text = text
-	b.TextSize = 16
+	b.TextSize = 15
 	b.Font = Enum.Font.GothamBold
 	b.TextColor3 = Theme.TextDim
 	b.Parent = titleBar
-	b.MouseEnter:Connect(function() tween(b, { TextColor3 = color or Theme.Text }, 0.15) end)
-	b.MouseLeave:Connect(function() tween(b, { TextColor3 = Theme.TextDim }, 0.15) end)
+	corner(b, 8)
+	local bs = stroke(b, Theme.Stroke, 1, 0.4)
+	b.MouseEnter:Connect(function()
+		tween(b, { BackgroundColor3 = hoverBg or Theme.ElementHi, BackgroundTransparency = 0, TextColor3 = hoverTxt or Theme.Text }, 0.15)
+		tween(bs, { Color = hoverTxt or Theme.Accent, Transparency = 0.2 }, 0.15)
+	end)
+	b.MouseLeave:Connect(function()
+		tween(b, { BackgroundColor3 = Theme.Element, BackgroundTransparency = 0.35, TextColor3 = Theme.TextDim }, 0.15)
+		tween(bs, { Color = Theme.Stroke, Transparency = 0.4 }, 0.15)
+	end)
 	return b
 end
-local btnMinimize = windowButton("–", -70)
-local btnClose    = windowButton("✕", -36, Theme.Danger)
+local btnMinimize = windowButton("–", -82, Theme.ElementHi, Theme.Accent)
+local btnClose    = windowButton("✕", -44, Color3.fromRGB(68, 26, 34), Theme.Danger)
 
 -- ------------------------------------------------------------- Sidebar
-local sidebar = Instance.new("Frame")
+local SIDE_W = 192
+local sidebarWrap = Instance.new("Frame")
+sidebarWrap.Name = "SidebarWrap"
+sidebarWrap.Size = UDim2.new(0, SIDE_W, 1, -63)
+sidebarWrap.Position = UDim2.fromOffset(0, 63)
+sidebarWrap.BackgroundColor3 = Theme.Sidebar
+sidebarWrap.BorderSizePixel = 0
+sidebarWrap.Parent = window
+
+local navCaption = label(sidebarWrap, "NAVIGATION", 10, Theme.TextDim, Enum.Font.GothamBold)
+navCaption.Position = UDim2.fromOffset(16, 10)
+navCaption.Size = UDim2.new(1, -24, 0, 14)
+
+local sidebar = Instance.new("ScrollingFrame")
 sidebar.Name = "Sidebar"
-sidebar.Size = UDim2.new(0, 180, 1, -55)
-sidebar.Position = UDim2.fromOffset(0, 55)
-sidebar.BackgroundColor3 = Theme.Sidebar
+sidebar.Size = UDim2.new(1, 0, 1, -92)
+sidebar.Position = UDim2.fromOffset(0, 26)
+sidebar.BackgroundTransparency = 1
 sidebar.BorderSizePixel = 0
-sidebar.Parent = window
+sidebar.ScrollBarThickness = 2
+sidebar.ScrollBarImageColor3 = Theme.StrokeHi
+sidebar.CanvasSize = UDim2.new(0, 0, 0, 0)
+sidebar.AutomaticCanvasSize = Enum.AutomaticSize.Y
+sidebar.Parent = sidebarWrap
 
 local sidebarList = Instance.new("UIListLayout")
-sidebarList.Padding = UDim.new(0, 4)
+sidebarList.Padding = UDim.new(0, 5)
 sidebarList.HorizontalAlignment = Enum.HorizontalAlignment.Center
 sidebarList.SortOrder = Enum.SortOrder.LayoutOrder
 sidebarList.Parent = sidebar
-pad(sidebar, 10, 8, 10, 8)
+pad(sidebar, 4, 10, 8, 10)
 
-local sidebarDivider = Instance.new("Frame")
-sidebarDivider.Size = UDim2.new(1, 0, 1, -55)
-sidebarDivider.Position = UDim2.fromOffset(180, 55)
-sidebarDivider.BackgroundTransparency = 1
-sidebarDivider.Parent = window
 local divLine = Instance.new("Frame")
-divLine.Size = UDim2.new(0, 1, 1, 0)
+divLine.Name = "SidebarDivider"
+divLine.Size = UDim2.new(0, 1, 1, -63)
+divLine.Position = UDim2.fromOffset(SIDE_W, 63)
 divLine.BackgroundColor3 = Theme.Stroke
 divLine.BorderSizePixel = 0
-divLine.Parent = sidebarDivider
+divLine.Parent = window
 
--- Sidebar footer: player + status pill (anchored to window bottom, outside list)
+-- Sidebar Footer: VIP Player Avatar + Name + Live Status Pill
 local sideFooter = Instance.new("Frame")
-sideFooter.Size = UDim2.new(0, 164, 0, 34)
-sideFooter.Position = UDim2.new(0, 8, 1, -44)
+sideFooter.Name = "SideFooter"
+sideFooter.Size = UDim2.new(1, -18, 0, 54)
+sideFooter.Position = UDim2.new(0, 9, 1, -63)
 sideFooter.BackgroundColor3 = Theme.Element
-sideFooter.Parent = window
-corner(sideFooter, 8)
+sideFooter.BorderSizePixel = 0
+sideFooter.Parent = sidebarWrap
+corner(sideFooter, 10)
+stroke(sideFooter, Theme.Stroke, 1)
+
+local avatarBox = Instance.new("Frame")
+avatarBox.Size = UDim2.fromOffset(34, 34)
+avatarBox.Position = UDim2.fromOffset(9, 10)
+avatarBox.BackgroundColor3 = Theme.Panel
+avatarBox.ClipsDescendants = true
+avatarBox.Parent = sideFooter
+corner(avatarBox, 100)
+stroke(avatarBox, Theme.Gold, 1.2, 0.25)
+
+local playerInitial = string.upper(string.sub(tostring((LocalPlayer and LocalPlayer.Name) or "P"), 1, 1))
+local avatarFallback = label(avatarBox, playerInitial, 14, Theme.Gold, Enum.Font.GothamBlack, Enum.TextXAlignment.Center)
+avatarFallback.Size = UDim2.fromScale(1, 1)
+
+local avatarImg = Instance.new("ImageLabel")
+avatarImg.Size = UDim2.fromScale(1, 1)
+avatarImg.BackgroundTransparency = 1
+avatarImg.Visible = false
+avatarImg.Parent = avatarBox
+corner(avatarImg, 100)
+task.spawn(function()
+	if LocalPlayer and type(Players.GetUserThumbnailAsync) == "function" then
+		local ok, thumb, ready = pcall(function()
+			return Players:GetUserThumbnailAsync(LocalPlayer.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+		end)
+		if ok and ready and type(thumb) == "string" and #thumb > 0 and avatarImg.Parent then
+			avatarImg.Image = thumb
+			avatarImg.Visible = true
+			avatarFallback.Visible = false
+		end
+	end
+end)
+
+local playerTitle = label(sideFooter, tostring((LocalPlayer and (LocalPlayer.DisplayName or LocalPlayer.Name)) or "Player"), 12, Theme.Text, Enum.Font.GothamBold)
+playerTitle.Position = UDim2.fromOffset(50, 8)
+playerTitle.Size = UDim2.new(1, -58, 0, 17)
+playerTitle.TextTruncate = Enum.TextTruncate.AtEnd
+
 local statusDot = Instance.new("Frame")
-statusDot.Size = UDim2.fromOffset(8, 8)
-statusDot.Position = UDim2.fromOffset(10, 13)
+statusDot.Size = UDim2.fromOffset(7, 7)
+statusDot.Position = UDim2.fromOffset(51, 32)
 statusDot.BackgroundColor3 = Theme.Success
 statusDot.Parent = sideFooter
 corner(statusDot, 100)
-local statusText = label(sideFooter, "Ready", 11, Theme.TextDim)
-statusText.Position = UDim2.fromOffset(26, 0)
-statusText.Size = UDim2.new(1, -30, 1, 0)
+
+local statusText = label(sideFooter, "Ready", 11, Theme.TextDim, Enum.Font.GothamMedium)
+statusText.Position = UDim2.fromOffset(63, 27)
+statusText.Size = UDim2.new(1, -68, 0, 17)
+statusText.TextTruncate = Enum.TextTruncate.AtEnd
 UI.StatusText = statusText
 UI.StatusDot = statusDot
 
 -- ------------------------------------------------------- Content container
 local content = Instance.new("Frame")
 content.Name = "Content"
-content.Size = UDim2.new(1, -180, 1, -55)
-content.Position = UDim2.fromOffset(180, 55)
+content.Size = UDim2.new(1, -SIDE_W - 1, 1, -63)
+content.Position = UDim2.fromOffset(SIDE_W + 1, 63)
 content.BackgroundTransparency = 1
+content.ClipsDescendants = true
 content.Parent = window
 
 -- ============================================================ TAB SYSTEM
 UI._tabButtons = {}
 local currentTab = nil
-UI.SwitchTab = nil -- assigned below
+UI.SwitchTab = nil
 
 local function switchTab(tabObj)
 	if currentTab == tabObj then return end
+	closeOpenDropdown()
 	if currentTab then
 		currentTab.page.Visible = false
-		tween(currentTab.button, { BackgroundTransparency = 1, TextColor3 = Theme.TextDim }, 0.18)
-		currentTab.button.Font = Enum.Font.Gotham
+		tween(currentTab.button, { BackgroundTransparency = 1, TextColor3 = Theme.TextDim }, 0.16)
+		tween(currentTab.activeBar, { BackgroundTransparency = 1 }, 0.16)
+		tween(currentTab.btnStroke, { Transparency = 1 }, 0.16)
+		currentTab.button.Font = Enum.Font.GothamMedium
 	end
 	currentTab = tabObj
 	tabObj.page.Visible = true
-	tween(tabObj.button, { BackgroundTransparency = 0, TextColor3 = Theme.Text }, 0.18)
+	tween(tabObj.button, { BackgroundTransparency = 0.08, TextColor3 = Theme.Text }, 0.18)
+	tween(tabObj.activeBar, { BackgroundTransparency = 0 }, 0.18)
+	tween(tabObj.btnStroke, { Transparency = 0.25 }, 0.18)
 	tabObj.button.Font = Enum.Font.GothamBold
-	-- soft page fade
-	tabObj.page.BackgroundTransparency = 1
 end
 UI.SwitchTab = switchTab
 
 function UI.NewTab(title, icon)
 	local order = #UI.Tabs + 1
 	local button = Instance.new("TextButton")
-	button.Size = UDim2.new(1, 0, 0, 38)
-	button.BackgroundColor3 = Theme.Accent
+	button.Name = "Tab_" .. title
+	button.Size = UDim2.new(1, 0, 0, 40)
+	button.BackgroundColor3 = Theme.Element
 	button.BackgroundTransparency = 1
-	button.Text = "   " .. (icon or "◈") .. "   " .. title
+	button.Text = "    " .. (icon or "◈") .. "   " .. title
 	button.TextSize = 13
 	button.TextColor3 = Theme.TextDim
-	button.Font = Enum.Font.Gotham
+	button.Font = Enum.Font.GothamMedium
 	button.TextXAlignment = Enum.TextXAlignment.Left
 	button.LayoutOrder = order
 	button.Parent = sidebar
-	corner(button, 8)
+	corner(button, 9)
+	local btnStroke = stroke(button, Theme.Accent, 1, 1)
 
 	local activeBar = Instance.new("Frame")
-	activeBar.Size = UDim2.fromOffset(3, 20)
-	activeBar.Position = UDim2.fromOffset(2, 9)
+	activeBar.Size = UDim2.fromOffset(3, 22)
+	activeBar.Position = UDim2.fromOffset(4, 9)
 	activeBar.BackgroundColor3 = Theme.Accent
 	activeBar.BackgroundTransparency = 1
+	activeBar.BorderSizePixel = 0
 	activeBar.Parent = button
 	corner(activeBar, 100)
+	gradient(activeBar, Theme.Gold, Theme.Accent, 90)
 
 	local page = Instance.new("ScrollingFrame")
 	page.Name = "Page_" .. title
@@ -917,64 +1462,102 @@ function UI.NewTab(title, icon)
 	page.Visible = false
 	page.Parent = content
 	local list = Instance.new("UIListLayout")
-	list.Padding = UDim.new(0, 10)
+	list.Padding = UDim.new(0, 12)
 	list.SortOrder = Enum.SortOrder.LayoutOrder
 	list.Parent = page
-	pad(page, 12, 14, 12, 14)
+	pad(page, 14, 16, 18, 16)
 
-	local tabObj = { title = title, button = button, page = page, sections = {}, order = order }
+	local tabObj = {
+		title = title,
+		button = button,
+		activeBar = activeBar,
+		btnStroke = btnStroke,
+		page = page,
+		sections = {},
+		order = order,
+	}
 	button.MouseButton1Click:Connect(function()
 		switchTab(tabObj)
 	end)
 	button.MouseEnter:Connect(function()
-		if currentTab ~= tabObj then tween(button, { BackgroundTransparency = 0.85 }, 0.15) end
+		if currentTab ~= tabObj then
+			tween(button, { BackgroundTransparency = 0.55, TextColor3 = Theme.Text }, 0.14)
+		end
 	end)
 	button.MouseLeave:Connect(function()
-		if currentTab ~= tabObj then tween(button, { BackgroundTransparency = 1 }, 0.15) end
+		if currentTab ~= tabObj then
+			tween(button, { BackgroundTransparency = 1, TextColor3 = Theme.TextDim }, 0.14)
+		end
 	end)
 
 	function tabObj:Section(sectionTitle)
 		local secOrder = #self.sections + 1
 		local sec = Instance.new("Frame")
+		sec.Name = "Sec_" .. (sectionTitle or tostring(secOrder))
 		sec.Size = UDim2.new(1, 0, 0, 0)
 		sec.AutomaticSize = Enum.AutomaticSize.Y
 		sec.BackgroundColor3 = Theme.Panel
 		sec.BorderSizePixel = 0
 		sec.LayoutOrder = secOrder * 10
 		sec.Parent = page
-		corner(sec, 10)
+		corner(sec, 12)
 		stroke(sec, Theme.Stroke, 1)
 
+		local secLayout = Instance.new("UIListLayout")
+		secLayout.SortOrder = Enum.SortOrder.LayoutOrder
+		secLayout.Padding = UDim.new(0, 0)
+		secLayout.Parent = sec
+
 		local head = Instance.new("TextButton")
-		head.Size = UDim2.new(1, 0, 0, 36)
+		head.Size = UDim2.new(1, 0, 0, 40)
 		head.BackgroundTransparency = 1
-		head.Text = "  " .. (sectionTitle or "Section")
-		head.TextSize = 13
-		head.TextColor3 = Theme.Text
-		head.Font = Enum.Font.GothamBold
-		head.TextXAlignment = Enum.TextXAlignment.Left
+		head.Text = ""
+		head.LayoutOrder = 1
 		head.Parent = sec
 
-		local arrow = label(head, "▾", 12, Theme.TextDim, Enum.Font.Gotham, Enum.TextXAlignment.Right)
-		arrow.Size = UDim2.fromOffset(24, 36)
-		arrow.Position = UDim2.new(1, -28, 0, 0)
+		local headAccent = Instance.new("Frame")
+		headAccent.Size = UDim2.fromOffset(3, 16)
+		headAccent.Position = UDim2.fromOffset(12, 12)
+		headAccent.BackgroundColor3 = Theme.Accent
+		headAccent.BorderSizePixel = 0
+		headAccent.Parent = head
+		corner(headAccent, 100)
+		gradient(headAccent, Theme.Gold, Theme.Accent, 90)
+
+		local headTitle = label(head, sectionTitle or "Section", 13, Theme.Text, Enum.Font.GothamBold)
+		headTitle.Position = UDim2.fromOffset(22, 0)
+		headTitle.Size = UDim2.new(1, -54, 1, 0)
+
+		local arrow = label(head, "▾", 12, Theme.TextDim, Enum.Font.GothamBold, Enum.TextXAlignment.Right)
+		arrow.Size = UDim2.fromOffset(24, 40)
+		arrow.Position = UDim2.new(1, -34, 0, 0)
+
+		local headDivider = Instance.new("Frame")
+		headDivider.Size = UDim2.new(1, -24, 0, 1)
+		headDivider.Position = UDim2.new(0, 12, 1, -1)
+		headDivider.BackgroundColor3 = Theme.Stroke
+		headDivider.BackgroundTransparency = 0.35
+		headDivider.BorderSizePixel = 0
+		headDivider.Parent = head
 
 		local body = Instance.new("Frame")
+		body.Name = "Body"
 		body.Size = UDim2.new(1, 0, 0, 0)
 		body.AutomaticSize = Enum.AutomaticSize.Y
-		body.Position = UDim2.fromOffset(0, 36)
 		body.BackgroundTransparency = 1
+		body.LayoutOrder = 2
 		body.Parent = sec
 		local bodyList = Instance.new("UIListLayout")
-		bodyList.Padding = UDim.new(0, 6)
+		bodyList.Padding = UDim.new(0, 7)
 		bodyList.SortOrder = Enum.SortOrder.LayoutOrder
 		bodyList.Parent = body
-		pad(body, 0, 12, 12, 12)
+		pad(body, 8, 12, 12, 12)
 
 		local collapsed = false
 		head.MouseButton1Click:Connect(function()
 			collapsed = not collapsed
 			body.Visible = not collapsed
+			headDivider.Visible = not collapsed
 			arrow.Text = collapsed and "▸" or "▾"
 		end)
 
@@ -985,52 +1568,73 @@ function UI.NewTab(title, icon)
 			return rowOrder * 10
 		end
 
-		-- generic row container
 		local function makeRow(height, name, keywords)
 			local row = Instance.new("Frame")
 			row.Size = UDim2.new(1, 0, 0, height)
 			row.BackgroundColor3 = Theme.Element
-			row.BackgroundTransparency = 0.25
+			row.BackgroundTransparency = 0.15
 			row.BorderSizePixel = 0
 			row.LayoutOrder = nextOrder()
 			row.Parent = body
-			corner(row, 8)
+			corner(row, 9)
+			local rs = stroke(row, Theme.Stroke, 1, 0.45)
 			registerElement(name, row, keywords)
+			table.insert(sectionObj.rows, row)
+			return row, rs
+		end
+
+		-- Expose raw container helper for custom grids (e.g. Dashboard KPI cards)
+		function sectionObj:CustomFrame(height, keywords)
+			local row = Instance.new("Frame")
+			row.Size = UDim2.new(1, 0, 0, height or 0)
+			row.AutomaticSize = height and Enum.AutomaticSize.None or Enum.AutomaticSize.Y
+			row.BackgroundTransparency = 1
+			row.BorderSizePixel = 0
+			row.LayoutOrder = nextOrder()
+			row.Parent = body
+			if keywords then registerElement(keywords, row, keywords) end
 			table.insert(sectionObj.rows, row)
 			return row
 		end
 
 		-- ---- Toggle -----------------------------------------------------
 		function sectionObj:Toggle(name, default, callback)
-			local row = makeRow(40, name)
+			local row, rs = makeRow(42, name)
 			local state = default and true or false
-			local nameLabel = label(row, name, 12, Theme.Text)
-			nameLabel.Position = UDim2.fromOffset(12, 0)
-			nameLabel.Size = UDim2.new(1, -80, 1, 0)
+			local nameLabel = label(row, name, 12, Theme.Text, Enum.Font.GothamMedium)
+			nameLabel.Position = UDim2.fromOffset(13, 0)
+			nameLabel.Size = UDim2.new(1, -82, 1, 0)
+			nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
 
-			local pill = Instance.new("Frame")
-			pill.Size = UDim2.fromOffset(42, 22)
-			pill.Position = UDim2.new(1, -54, 0.5, -11)
-			pill.BackgroundColor3 = state and Theme.Success or Theme.ElementHi
-			pill.Parent = row
-			corner(pill, 100)
+			local switch = Instance.new("Frame")
+			switch.Size = UDim2.fromOffset(44, 24)
+			switch.Position = UDim2.new(1, -56, 0.5, -12)
+			switch.BackgroundColor3 = state and Theme.Success or Theme.ElementHi
+			switch.BorderSizePixel = 0
+			switch.Parent = row
+			corner(switch, 100)
+			local swStroke = stroke(switch, state and Theme.Success or Theme.StrokeHi, 1, 0.3)
+
 			local knob = Instance.new("Frame")
-			knob.Size = UDim2.fromOffset(16, 16)
+			knob.Size = UDim2.fromOffset(18, 18)
 			knob.Position = UDim2.fromOffset(state and 23 or 3, 3)
 			knob.BackgroundColor3 = Theme.Text
-			knob.Parent = pill
+			knob.BorderSizePixel = 0
+			knob.Parent = switch
 			corner(knob, 100)
 
 			local hit = Instance.new("TextButton")
-			hit.Size = UDim2.new(1, 0, 1, 0)
+			hit.Size = UDim2.fromScale(1, 1)
 			hit.BackgroundTransparency = 1
 			hit.Text = ""
 			hit.Parent = row
 
 			local obj = {}
 			local function render()
-				tween(pill, { BackgroundColor3 = state and Theme.Success or Theme.ElementHi }, 0.18)
+				tween(switch, { BackgroundColor3 = state and Theme.Success or Theme.ElementHi }, 0.18)
+				tween(swStroke, { Color = state and Theme.Success or Theme.StrokeHi }, 0.18)
 				tween(knob, { Position = UDim2.fromOffset(state and 23 or 3, 3) }, 0.18, Enum.EasingStyle.Back)
+				tween(rs, { Color = state and Theme.Success or Theme.Stroke, Transparency = state and 0.55 or 0.45 }, 0.18)
 			end
 			function obj:Set(v)
 				state = v and true or false
@@ -1038,28 +1642,51 @@ function UI.NewTab(title, icon)
 				if callback then fireCallback(callback, state) end
 			end
 			function obj:Get() return state end
+			hit.MouseEnter:Connect(function()
+				tween(row, { BackgroundColor3 = Theme.ElementHi }, 0.12)
+			end)
+			hit.MouseLeave:Connect(function()
+				tween(row, { BackgroundColor3 = Theme.Element }, 0.12)
+			end)
 			hit.MouseButton1Click:Connect(function() obj:Set(not state) end)
 			render()
 			return obj
 		end
 
 		-- ---- Button ----------------------------------------------------
-		function sectionObj:Button(name, callback)
-			local row = makeRow(38, name)
-			row.BackgroundTransparency = 0.1
+		function sectionObj:Button(name, callback, accentColor)
+			local row, rs = makeRow(38, name)
+			row.BackgroundTransparency = 0.05
+			local hiCol = accentColor or Theme.Accent
+			rs.Color = hiCol
+			rs.Transparency = 0.65
+
 			local b = Instance.new("TextButton")
-			b.Size = UDim2.new(1, 0, 1, 0)
+			b.Size = UDim2.fromScale(1, 1)
 			b.BackgroundTransparency = 1
 			b.Text = name
 			b.TextSize = 12
-			b.TextColor3 = Theme.Accent
+			b.TextColor3 = hiCol
 			b.Font = Enum.Font.GothamBold
 			b.Parent = row
-			b.MouseEnter:Connect(function() tween(row, { BackgroundColor3 = Theme.ElementHi }, 0.15) end)
-			b.MouseLeave:Connect(function() tween(row, { BackgroundColor3 = Theme.Element }, 0.15) end)
+
+			b.MouseEnter:Connect(function()
+				tween(row, { BackgroundColor3 = Theme.ElementHi }, 0.14)
+				tween(rs, { Transparency = 0.2 }, 0.14)
+			end)
+			b.MouseLeave:Connect(function()
+				tween(row, { BackgroundColor3 = Theme.Element }, 0.14)
+				tween(rs, { Transparency = 0.65 }, 0.14)
+			end)
 			b.MouseButton1Click:Connect(function()
-				tween(row, { BackgroundColor3 = Theme.Accent }, 0.08)
-				tween(row, { BackgroundColor3 = Theme.Element }, 0.25)
+				tween(row, { BackgroundColor3 = hiCol }, 0.08)
+				tween(b, { TextColor3 = Theme.Bg }, 0.08)
+				task.delay(0.14, function()
+					if row.Parent then
+						tween(row, { BackgroundColor3 = Theme.Element }, 0.22)
+						tween(b, { TextColor3 = hiCol }, 0.22)
+					end
+				end)
 				if callback then fireCallback(callback) end
 			end)
 			return { Set = function(_, newName) b.Text = newName end }
@@ -1068,47 +1695,77 @@ function UI.NewTab(title, icon)
 		-- ---- Slider ---------------------------------------------------
 		function sectionObj:Slider(name, minV, maxV, default, callback, step)
 			step = step or 1
-			local row = makeRow(52, name)
+			local row = makeRow(58, name)
 			local value = clamp(default or minV, minV, maxV)
+			local span = (maxV - minV)
+			if span == 0 then span = 1 end
 
-			local nameLabel = label(row, name, 12, Theme.Text)
-			nameLabel.Position = UDim2.fromOffset(12, 2)
-			nameLabel.Size = UDim2.new(1, -70, 0, 20)
+			local nameLabel = label(row, name, 12, Theme.Text, Enum.Font.GothamMedium)
+			nameLabel.Position = UDim2.fromOffset(13, 4)
+			nameLabel.Size = UDim2.new(1, -86, 0, 22)
 
-			local valueLabel = label(row, tostring(value), 12, Theme.Accent, Enum.Font.GothamBold, Enum.TextXAlignment.Right)
-			valueLabel.Position = UDim2.new(1, -58, 0, 2)
-			valueLabel.Size = UDim2.fromOffset(46, 20)
+			local valPill = Instance.new("Frame")
+			valPill.Size = UDim2.fromOffset(62, 22)
+			valPill.Position = UDim2.new(1, -74, 0, 6)
+			valPill.BackgroundColor3 = Theme.BgAlt
+			valPill.BorderSizePixel = 0
+			valPill.Parent = row
+			corner(valPill, 6)
+			stroke(valPill, Theme.StrokeHi, 1, 0.35)
+
+			local valueLabel = label(valPill, tostring(value), 11, Theme.Accent, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+			valueLabel.Size = UDim2.fromScale(1, 1)
 
 			local track = Instance.new("Frame")
-			track.Size = UDim2.new(1, -24, 0, 6)
-			track.Position = UDim2.fromOffset(12, 34)
-			track.BackgroundColor3 = Theme.ElementHi
+			track.Size = UDim2.new(1, -28, 0, 6)
+			track.Position = UDim2.fromOffset(14, 38)
+			track.BackgroundColor3 = Theme.BgAlt
+			track.BorderSizePixel = 0
 			track.Parent = row
 			corner(track, 100)
 
+			local initRatio = clamp((value - minV) / span, 0, 1)
 			local fill = Instance.new("Frame")
-			fill.Size = UDim2.fromScale((value - minV) / (maxV - minV), 1)
+			fill.Size = UDim2.fromScale(initRatio, 1)
 			fill.BackgroundColor3 = Theme.Accent
+			fill.BorderSizePixel = 0
 			fill.Parent = track
 			corner(fill, 100)
-			local fillGrad = Instance.new("UIGradient")
-			fillGrad.Color = ColorSequence.new(Theme.Accent, Theme.Accent2)
-			fillGrad.Parent = fill
+			gradient(fill, Theme.Gold, Theme.Accent, 0)
+
+			local thumb = Instance.new("Frame")
+			thumb.Size = UDim2.fromOffset(14, 14)
+			thumb.AnchorPoint = Vector2.new(0.5, 0.5)
+			thumb.Position = UDim2.new(initRatio, 0, 0.5, 0)
+			thumb.BackgroundColor3 = Theme.Text
+			thumb.BorderSizePixel = 0
+			thumb.Parent = track
+			corner(thumb, 100)
+			stroke(thumb, Theme.Accent, 2)
+
+			local function applyVisual(v)
+				local r = clamp((v - minV) / span, 0, 1)
+				valueLabel.Text = tostring(v)
+				fill.Size = UDim2.fromScale(r, 1)
+				thumb.Position = UDim2.new(r, 0, 0.5, 0)
+			end
 
 			local dragging = false
 			local function setValueFromX(x)
-				local rel = clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
-				local v = round(minV + rel * (maxV - minV), step)
-				v = clamp(v, minV, maxV)
-				value = v
-				valueLabel.Text = tostring(v)
-				fill.Size = UDim2.fromScale((v - minV) / (maxV - minV), 1)
-				if callback then fireCallback(callback, v) end
+				local absW = track.AbsoluteSize.X
+				if absW <= 0 then absW = 1 end
+				local rel = clamp((x - track.AbsolutePosition.X) / absW, 0, 1)
+				local v = clamp(round(minV + rel * span, step), minV, maxV)
+				if v ~= value then
+					value = v
+					applyVisual(v)
+					if callback then fireCallback(callback, v) end
+				end
 			end
 
 			local hit = Instance.new("TextButton")
-			hit.Size = UDim2.new(1, 0, 0, 26)
-			hit.Position = UDim2.fromOffset(0, 26)
+			hit.Size = UDim2.new(1, 0, 0, 28)
+			hit.Position = UDim2.fromOffset(0, 28)
 			hit.BackgroundTransparency = 1
 			hit.Text = ""
 			hit.Parent = row
@@ -1121,94 +1778,169 @@ function UI.NewTab(title, icon)
 					dragging = false
 				end
 			end))
-			UserInputService.InputChanged:Connect(function(input)
+			Hub.trackConnection(UserInputService.InputChanged:Connect(function(input)
 				if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
 					setValueFromX(input.Position.X)
 				end
-			end)
+			end))
 
 			return {
 				Get = function() return value end,
 				Set = function(_, v)
 					value = clamp(round(v, step), minV, maxV)
-					valueLabel.Text = tostring(value)
-					fill.Size = UDim2.fromScale((value - minV) / (maxV - minV), 1)
+					applyVisual(value)
 					if callback then fireCallback(callback, value) end
 				end,
 			}
 		end
 
-		-- ---- Dropdown -------------------------------------------------
+		-- ---- Dropdown (Inline Accordion — ZERO Overlap!) ---------------
 		function sectionObj:Dropdown(name, options, default, callback)
-			local row = makeRow(40, name, table.concat(options or {}, " "))
+			local BASE_H = 44
+			local OPT_H = 30
+			local row, rs = makeRow(BASE_H, name, table.concat(options or {}, " "))
+			row.ClipsDescendants = true
 			local selected = default or (options and options[1])
 			local open = false
 
-			local nameLabel = label(row, name, 12, Theme.Text)
-			nameLabel.Position = UDim2.fromOffset(12, 0)
-			nameLabel.Size = UDim2.new(0.45, 0, 1, 0)
+			local header = Instance.new("Frame")
+			header.Size = UDim2.new(1, 0, 0, BASE_H)
+			header.BackgroundTransparency = 1
+			header.Parent = row
+
+			local nameLabel = label(header, name, 12, Theme.Text, Enum.Font.GothamMedium)
+			nameLabel.Position = UDim2.fromOffset(13, 0)
+			nameLabel.Size = UDim2.new(0.46, -12, 1, 0)
+			nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
 
 			local valueBtn = Instance.new("TextButton")
-			valueBtn.Size = UDim2.new(0.5, -20, 1, -10)
-			valueBtn.Position = UDim2.new(0.5, 4, 0, 5)
-			valueBtn.BackgroundColor3 = Theme.ElementHi
-			valueBtn.Text = tostring(selected) .. "  ▾"
-			valueBtn.TextSize = 11
-			valueBtn.TextColor3 = Theme.TextDim
-			valueBtn.Font = Enum.Font.Gotham
-			valueBtn.TextTruncate = Enum.TextTruncate.AtEnd
-			valueBtn.Parent = row
-			corner(valueBtn, 6)
+			valueBtn.Size = UDim2.new(0.54, -18, 0, 30)
+			valueBtn.Position = UDim2.new(0.46, 6, 0.5, -15)
+			valueBtn.BackgroundColor3 = Theme.BgAlt
+			valueBtn.Text = ""
+			valueBtn.Parent = header
+			corner(valueBtn, 7)
+			local vbStroke = stroke(valueBtn, Theme.StrokeHi, 1, 0.35)
 
-			local listFrame = Instance.new("ScrollingFrame")
-			listFrame.Size = UDim2.new(0.5, -20, 0, 0)
-			listFrame.Position = UDim2.new(0.5, 4, 1, -5)
-			listFrame.BackgroundColor3 = Theme.Panel
-			listFrame.BorderSizePixel = 0
-			listFrame.ScrollBarThickness = 3
-			listFrame.Visible = false
-			listFrame.ZIndex = 20
-			listFrame.Parent = row
-			corner(listFrame, 6)
-			stroke(listFrame, Theme.Stroke, 1)
+			local valueTxt = label(valueBtn, tostring(selected), 11, Theme.Text, Enum.Font.GothamMedium)
+			valueTxt.Position = UDim2.fromOffset(10, 0)
+			valueTxt.Size = UDim2.new(1, -28, 1, 0)
+			valueTxt.TextTruncate = Enum.TextTruncate.AtEnd
+
+			local chev = label(valueBtn, "▾", 12, Theme.Accent, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+			chev.Size = UDim2.fromOffset(22, 30)
+			chev.Position = UDim2.new(1, -24, 0, 0)
+
+			-- Inline accordion drawer (expands row height inside UIListLayout)
+			local drawer = Instance.new("Frame")
+			drawer.Name = "Drawer"
+			drawer.Position = UDim2.fromOffset(10, BASE_H + 2)
+			drawer.Size = UDim2.new(1, -20, 0, 0)
+			drawer.BackgroundColor3 = Theme.BgAlt
+			drawer.BorderSizePixel = 0
+			drawer.Visible = false
+			drawer.ClipsDescendants = true
+			drawer.Parent = row
+			corner(drawer, 8)
+			stroke(drawer, Theme.StrokeHi, 1, 0.25)
+
+			local scroll = Instance.new("ScrollingFrame")
+			scroll.Size = UDim2.fromScale(1, 1)
+			scroll.BackgroundTransparency = 1
+			scroll.BorderSizePixel = 0
+			scroll.ScrollBarThickness = 3
+			scroll.ScrollBarImageColor3 = Theme.Accent
+			scroll.Parent = drawer
 			local llist = Instance.new("UIListLayout")
+			llist.Padding = UDim.new(0, 3)
 			llist.SortOrder = Enum.SortOrder.LayoutOrder
-			llist.Parent = listFrame
+			llist.Parent = scroll
+			pad(scroll, 5, 6, 5, 6)
 
-			local obj = {}
+			local obj = { _row = row }
+			local function calcDrawerH()
+				local count = #(options or {})
+				return math.min(math.max(count, 1) * (OPT_H + 3) + 10, 176)
+			end
+
+			local setOpen
+			local function closeSelf()
+				if open then setOpen(false) end
+			end
+
 			local function rebuild()
-				for _, c in ipairs(listFrame:GetChildren()) do
+				for _, c in ipairs(scroll:GetChildren()) do
 					if c:IsA("TextButton") then c:Destroy() end
 				end
 				for i, opt in ipairs(options or {}) do
+					local isSel = (opt == selected)
 					local ob = Instance.new("TextButton")
-					ob.Size = UDim2.new(1, 0, 0, 26)
-					ob.BackgroundColor3 = (opt == selected) and Theme.Accent or Theme.Panel
-					ob.BackgroundTransparency = (opt == selected) and 0.4 or 1
-					ob.Text = "  " .. tostring(opt)
-					ob.TextSize = 11
-					ob.TextColor3 = Theme.Text
-					ob.Font = Enum.Font.Gotham
-					ob.TextXAlignment = Enum.TextXAlignment.Left
+					ob.Size = UDim2.new(1, 0, 0, OPT_H)
+					ob.BackgroundColor3 = isSel and Theme.ElementHi or Theme.Element
+					ob.BackgroundTransparency = isSel and 0.05 or 0.65
+					ob.Text = ""
 					ob.LayoutOrder = i
-					ob.ZIndex = 21
-					ob.Parent = listFrame
+					ob.Parent = scroll
+					corner(ob, 6)
+					if isSel then stroke(ob, Theme.Accent, 1, 0.35) end
+
+					local mark = label(ob, isSel and "●" or "○", 11, isSel and Theme.Gold or Theme.TextDim, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+					mark.Size = UDim2.fromOffset(22, OPT_H)
+					mark.Position = UDim2.fromOffset(4, 0)
+
+					local ot = label(ob, tostring(opt), 11, isSel and Theme.Text or Theme.TextDim, isSel and Enum.Font.GothamBold or Enum.Font.Gotham)
+					ot.Position = UDim2.fromOffset(26, 0)
+					ot.Size = UDim2.new(1, -34, 1, 0)
+					ot.TextTruncate = Enum.TextTruncate.AtEnd
+
+					ob.MouseEnter:Connect(function()
+						if not isSel then tween(ob, { BackgroundTransparency = 0.25 }, 0.1) end
+					end)
+					ob.MouseLeave:Connect(function()
+						if not isSel then tween(ob, { BackgroundTransparency = 0.65 }, 0.1) end
+					end)
 					ob.MouseButton1Click:Connect(function()
 						obj:Select(opt)
 					end)
 				end
-				listFrame.CanvasSize = UDim2.fromOffset(0, #options * 26 + 4)
+				local contentH = #(options or {}) * (OPT_H + 3) + 10
+				scroll.CanvasSize = UDim2.fromOffset(0, contentH)
+				if open then
+					local dh = calcDrawerH()
+					drawer.Size = UDim2.new(1, -20, 0, dh)
+					row.Size = UDim2.new(1, 0, 0, BASE_H + dh + 10)
+				end
 			end
 
-			local function setOpen(v)
-				open = v
-				listFrame.Visible = v
-				tween(listFrame, { Size = UDim2.new(0.5, -20, 0, v and math.min(#options * 26 + 4, 130) or 0) }, 0.18)
+			setOpen = function(v)
+				open = v and true or false
+				if open then
+					closeOpenDropdown(closeSelf)
+					UI._openDropdown = closeSelf
+					local dh = calcDrawerH()
+					drawer.Visible = true
+					drawer.Size = UDim2.new(1, -20, 0, dh)
+					chev.Text = "▴"
+					tween(rs, { Color = Theme.Accent, Transparency = 0.2 }, 0.16)
+					tween(vbStroke, { Color = Theme.Accent, Transparency = 0.1 }, 0.16)
+					tween(row, { Size = UDim2.new(1, 0, 0, BASE_H + dh + 10) }, 0.18)
+				else
+					if UI._openDropdown == closeSelf then UI._openDropdown = nil end
+					chev.Text = "▾"
+					tween(rs, { Color = Theme.Stroke, Transparency = 0.45 }, 0.16)
+					tween(vbStroke, { Color = Theme.StrokeHi, Transparency = 0.35 }, 0.16)
+					tween(row, { Size = UDim2.new(1, 0, 0, BASE_H) }, 0.16)
+					task.delay(0.17, function()
+						if not open and drawer.Parent then drawer.Visible = false end
+					end)
+				end
 			end
 
+			function obj:SetOpen(v) setOpen(v) end
+			function obj:IsOpen() return open end
 			function obj:Select(opt)
 				selected = opt
-				valueBtn.Text = tostring(opt) .. "  ▾"
+				valueTxt.Text = tostring(opt)
 				setOpen(false)
 				rebuild()
 				if callback then fireCallback(callback, opt) end
@@ -1216,8 +1948,9 @@ function UI.NewTab(title, icon)
 			function obj:Get() return selected end
 			function obj:Set(opt) obj:Select(opt) end
 			function obj:SetOptions(newOptions)
-				options = newOptions
+				options = newOptions or {}
 				if not table.find(options, selected) then selected = options[1] end
+				valueTxt.Text = tostring(selected or "")
 				rebuild()
 			end
 
@@ -1226,80 +1959,205 @@ function UI.NewTab(title, icon)
 			return obj
 		end
 
-		-- ---- MultiDropdown --------------------------------------------
+		-- ---- MultiDropdown (Inline Accordion + All/Clear — ZERO Overlap!) --
 		function sectionObj:MultiDropdown(name, options, defaults, callback)
-			local row = makeRow(40, name, table.concat(options or {}, " "))
+			local BASE_H = 44
+			local BAR_H = 26
+			local OPT_H = 28
+			local row, rs = makeRow(BASE_H, name, table.concat(options or {}, " "))
+			row.ClipsDescendants = true
 			local chosen = {}
 			for _, v in ipairs(defaults or {}) do chosen[v] = true end
 			local open = false
 
-			local nameLabel = label(row, name, 12, Theme.Text)
-			nameLabel.Position = UDim2.fromOffset(12, 0)
-			nameLabel.Size = UDim2.new(0.45, 0, 1, 0)
+			local header = Instance.new("Frame")
+			header.Size = UDim2.new(1, 0, 0, BASE_H)
+			header.BackgroundTransparency = 1
+			header.Parent = row
+
+			local nameLabel = label(header, name, 12, Theme.Text, Enum.Font.GothamMedium)
+			nameLabel.Position = UDim2.fromOffset(13, 0)
+			nameLabel.Size = UDim2.new(0.46, -12, 1, 0)
+			nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
 
 			local valueBtn = Instance.new("TextButton")
-			valueBtn.Size = UDim2.new(0.5, -20, 1, -10)
-			valueBtn.Position = UDim2.new(0.5, 4, 0, 5)
-			valueBtn.BackgroundColor3 = Theme.ElementHi
-			valueBtn.TextSize = 11
-			valueBtn.TextColor3 = Theme.TextDim
-			valueBtn.Font = Enum.Font.Gotham
-			valueBtn.TextTruncate = Enum.TextTruncate.AtEnd
-			valueBtn.Parent = row
-			corner(valueBtn, 6)
+			valueBtn.Size = UDim2.new(0.54, -18, 0, 30)
+			valueBtn.Position = UDim2.new(0.46, 6, 0.5, -15)
+			valueBtn.BackgroundColor3 = Theme.BgAlt
+			valueBtn.Text = ""
+			valueBtn.Parent = header
+			corner(valueBtn, 7)
+			local vbStroke = stroke(valueBtn, Theme.StrokeHi, 1, 0.35)
 
+			local valueTxt = label(valueBtn, "None", 11, Theme.TextDim, Enum.Font.GothamMedium)
+			valueTxt.Position = UDim2.fromOffset(10, 0)
+			valueTxt.Size = UDim2.new(1, -28, 1, 0)
+			valueTxt.TextTruncate = Enum.TextTruncate.AtEnd
+
+			local chev = label(valueBtn, "▾", 12, Theme.Accent, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+			chev.Size = UDim2.fromOffset(22, 30)
+			chev.Position = UDim2.new(1, -24, 0, 0)
+
+			local drawer = Instance.new("Frame")
+			drawer.Name = "Drawer"
+			drawer.Position = UDim2.fromOffset(10, BASE_H + 2)
+			drawer.Size = UDim2.new(1, -20, 0, 0)
+			drawer.BackgroundColor3 = Theme.BgAlt
+			drawer.BorderSizePixel = 0
+			drawer.Visible = false
+			drawer.ClipsDescendants = true
+			drawer.Parent = row
+			corner(drawer, 8)
+			stroke(drawer, Theme.StrokeHi, 1, 0.25)
+
+			-- Utility header inside drawer (Count + All / Clear)
+			local utilBar = Instance.new("Frame")
+			utilBar.Size = UDim2.new(1, 0, 0, BAR_H)
+			utilBar.BackgroundColor3 = Theme.Panel
+			utilBar.BorderSizePixel = 0
+			utilBar.Parent = drawer
+
+			local countLbl = label(utilBar, "Selected: 0", 10, Theme.TextDim, Enum.Font.GothamBold)
+			countLbl.Position = UDim2.fromOffset(10, 0)
+			countLbl.Size = UDim2.new(1, -110, 1, 0)
+
+			local function makeMiniBtn(txt, xOff, col)
+				local mb = Instance.new("TextButton")
+				mb.Size = UDim2.fromOffset(44, 18)
+				mb.Position = UDim2.new(1, xOff, 0.5, -9)
+				mb.BackgroundColor3 = Theme.Element
+				mb.Text = txt
+				mb.TextSize = 10
+				mb.Font = Enum.Font.GothamBold
+				mb.TextColor3 = col
+				mb.Parent = utilBar
+				corner(mb, 5)
+				return mb
+			end
+			local btnAll = makeMiniBtn("All", -98, Theme.Accent)
+			local btnClr = makeMiniBtn("Clear", -50, Theme.Danger)
+
+			local scroll = Instance.new("ScrollingFrame")
+			scroll.Position = UDim2.fromOffset(0, BAR_H)
+			scroll.Size = UDim2.new(1, 0, 1, -BAR_H)
+			scroll.BackgroundTransparency = 1
+			scroll.BorderSizePixel = 0
+			scroll.ScrollBarThickness = 3
+			scroll.ScrollBarImageColor3 = Theme.Accent
+			scroll.Parent = drawer
+			local llist = Instance.new("UIListLayout")
+			llist.Padding = UDim.new(0, 3)
+			llist.SortOrder = Enum.SortOrder.LayoutOrder
+			llist.Parent = scroll
+			pad(scroll, 5, 6, 5, 6)
+
+			local obj = { _row = row }
 			local function summary()
 				local parts = {}
 				for _, o in ipairs(options or {}) do
 					if chosen[o] then table.insert(parts, tostring(o)) end
 				end
-				if #parts == 0 then return "None  ▾" end
-				return table.concat(parts, ", ") .. "  ▾"
+				countLbl.Text = "Selected: " .. #parts .. " / " .. #(options or {})
+				if #parts == 0 then
+					valueTxt.TextColor3 = Theme.TextDim
+					return "None"
+				end
+				valueTxt.TextColor3 = Theme.Text
+				return table.concat(parts, ", ")
 			end
 
-			local listFrame = Instance.new("ScrollingFrame")
-			listFrame.Size = UDim2.new(0.5, -20, 0, 0)
-			listFrame.Position = UDim2.new(0.5, 4, 1, -5)
-			listFrame.BackgroundColor3 = Theme.Panel
-			listFrame.BorderSizePixel = 0
-			listFrame.ScrollBarThickness = 3
-			listFrame.Visible = false
-			listFrame.ZIndex = 20
-			listFrame.Parent = row
-			corner(listFrame, 6)
-			stroke(listFrame, Theme.Stroke, 1)
-			local llist = Instance.new("UIListLayout")
-			llist.SortOrder = Enum.SortOrder.LayoutOrder
-			llist.Parent = listFrame
+			local function calcDrawerH()
+				local count = #(options or {})
+				return BAR_H + math.min(math.max(count, 1) * (OPT_H + 3) + 10, 152)
+			end
 
-			local obj = {}
+			local setOpen
+			local function closeSelf()
+				if open then setOpen(false) end
+			end
+
 			local function rebuild()
-				for _, c in ipairs(listFrame:GetChildren()) do
+				for _, c in ipairs(scroll:GetChildren()) do
 					if c:IsA("TextButton") then c:Destroy() end
 				end
 				for i, opt in ipairs(options or {}) do
+					local isSel = chosen[opt] == true
 					local ob = Instance.new("TextButton")
-					ob.Size = UDim2.new(1, 0, 0, 26)
-					ob.BackgroundColor3 = Theme.Panel
-					ob.BackgroundTransparency = 1
-					ob.Text = (chosen[opt] and "  ✓ " or "  ○ ") .. tostring(opt)
-					ob.TextSize = 11
-					ob.TextColor3 = chosen[opt] and Theme.Success or Theme.Text
-					ob.Font = Enum.Font.Gotham
-					ob.TextXAlignment = Enum.TextXAlignment.Left
+					ob.Size = UDim2.new(1, 0, 0, OPT_H)
+					ob.BackgroundColor3 = isSel and Theme.ElementHi or Theme.Element
+					ob.BackgroundTransparency = isSel and 0.1 or 0.7
+					ob.Text = ""
 					ob.LayoutOrder = i
-					ob.ZIndex = 21
-					ob.Parent = listFrame
+					ob.Parent = scroll
+					corner(ob, 6)
+					if isSel then stroke(ob, Theme.Success, 1, 0.45) end
+
+					local box = Instance.new("Frame")
+					box.Size = UDim2.fromOffset(16, 16)
+					box.Position = UDim2.fromOffset(8, 6)
+					box.BackgroundColor3 = isSel and Theme.Success or Theme.BgAlt
+					box.BorderSizePixel = 0
+					box.Parent = ob
+					corner(box, 4)
+					stroke(box, isSel and Theme.Success or Theme.StrokeHi, 1)
+					local tickLbl = label(box, isSel and "✓" or "", 11, Theme.Bg, Enum.Font.GothamBlack, Enum.TextXAlignment.Center)
+					tickLbl.Size = UDim2.fromScale(1, 1)
+
+					local ot = label(ob, tostring(opt), 11, isSel and Theme.Text or Theme.TextDim, isSel and Enum.Font.GothamBold or Enum.Font.Gotham)
+					ot.Position = UDim2.fromOffset(32, 0)
+					ot.Size = UDim2.new(1, -38, 1, 0)
+					ot.TextTruncate = Enum.TextTruncate.AtEnd
+
 					ob.MouseButton1Click:Connect(function()
 						chosen[opt] = not chosen[opt] or nil
 						rebuild()
-						valueBtn.Text = summary()
+						valueTxt.Text = summary()
 						if callback then fireCallback(callback, obj:Get()) end
 					end)
 				end
-				listFrame.CanvasSize = UDim2.fromOffset(0, #options * 26 + 4)
+				local contentH = #(options or {}) * (OPT_H + 3) + 10
+				scroll.CanvasSize = UDim2.fromOffset(0, contentH)
+				valueTxt.Text = summary()
 			end
 
+			setOpen = function(v)
+				open = v and true or false
+				if open then
+					closeOpenDropdown(closeSelf)
+					UI._openDropdown = closeSelf
+					local dh = calcDrawerH()
+					drawer.Visible = true
+					drawer.Size = UDim2.new(1, -20, 0, dh)
+					chev.Text = "▴"
+					tween(rs, { Color = Theme.Accent, Transparency = 0.2 }, 0.16)
+					tween(vbStroke, { Color = Theme.Accent, Transparency = 0.1 }, 0.16)
+					tween(row, { Size = UDim2.new(1, 0, 0, BASE_H + dh + 10) }, 0.18)
+				else
+					if UI._openDropdown == closeSelf then UI._openDropdown = nil end
+					chev.Text = "▾"
+					tween(rs, { Color = Theme.Stroke, Transparency = 0.45 }, 0.16)
+					tween(vbStroke, { Color = Theme.StrokeHi, Transparency = 0.35 }, 0.16)
+					tween(row, { Size = UDim2.new(1, 0, 0, BASE_H) }, 0.16)
+					task.delay(0.17, function()
+						if not open and drawer.Parent then drawer.Visible = false end
+					end)
+				end
+			end
+
+			btnAll.MouseButton1Click:Connect(function()
+				chosen = {}
+				for _, o in ipairs(options or {}) do chosen[o] = true end
+				rebuild()
+				if callback then fireCallback(callback, obj:Get()) end
+			end)
+			btnClr.MouseButton1Click:Connect(function()
+				chosen = {}
+				rebuild()
+				if callback then fireCallback(callback, obj:Get()) end
+			end)
+
+			function obj:SetOpen(v) setOpen(v) end
+			function obj:IsOpen() return open end
 			function obj:Get()
 				local out = {}
 				for _, o in ipairs(options or {}) do
@@ -1311,37 +2169,30 @@ function UI.NewTab(title, icon)
 				chosen = {}
 				for _, v in ipairs(list or {}) do chosen[v] = true end
 				rebuild()
-				valueBtn.Text = summary()
 				if callback then fireCallback(callback, obj:Get()) end
 			end
 			function obj:SetOptions(newOptions)
-				options = newOptions
+				options = newOptions or {}
 				rebuild()
-				valueBtn.Text = summary()
 			end
 
-			valueBtn.MouseButton1Click:Connect(function()
-				open = not open
-				listFrame.Visible = open
-				tween(listFrame, { Size = UDim2.new(0.5, -20, 0, open and math.min(#options * 26 + 4, 130) or 0) }, 0.18)
-			end)
-
-			valueBtn.Text = summary()
+			valueBtn.MouseButton1Click:Connect(function() setOpen(not open) end)
 			rebuild()
 			return obj
 		end
 
 		-- ---- Input ----------------------------------------------------
 		function sectionObj:Input(name, placeholder, callback)
-			local row = makeRow(40, name)
-			local nameLabel = label(row, name, 12, Theme.Text)
-			nameLabel.Position = UDim2.fromOffset(12, 0)
-			nameLabel.Size = UDim2.new(0.45, 0, 1, 0)
+			local row = makeRow(42, name)
+			local nameLabel = label(row, name, 12, Theme.Text, Enum.Font.GothamMedium)
+			nameLabel.Position = UDim2.fromOffset(13, 0)
+			nameLabel.Size = UDim2.new(0.45, -12, 1, 0)
+			nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
 
 			local box = Instance.new("TextBox")
-			box.Size = UDim2.new(0.5, -20, 1, -10)
-			box.Position = UDim2.new(0.5, 4, 0, 5)
-			box.BackgroundColor3 = Theme.ElementHi
+			box.Size = UDim2.new(0.55, -18, 0, 30)
+			box.Position = UDim2.new(0.45, 6, 0.5, -15)
+			box.BackgroundColor3 = Theme.BgAlt
 			box.PlaceholderText = placeholder or ""
 			box.PlaceholderColor3 = Theme.TextDim
 			box.Text = ""
@@ -1351,10 +2202,13 @@ function UI.NewTab(title, icon)
 			box.ClearTextOnFocus = false
 			box.TextXAlignment = Enum.TextXAlignment.Left
 			box.Parent = row
-			corner(box, 6)
-			pad(box, 0, 8, 0, 8)
+			corner(box, 7)
+			local bs = stroke(box, Theme.StrokeHi, 1, 0.4)
+			pad(box, 0, 9, 0, 9)
 
+			box.Focused:Connect(function() tween(bs, { Color = Theme.Accent, Transparency = 0.1 }, 0.15) end)
 			box.FocusLost:Connect(function()
+				tween(bs, { Color = Theme.StrokeHi, Transparency = 0.4 }, 0.15)
 				if callback then fireCallback(callback, box.Text) end
 			end)
 			return {
@@ -1365,33 +2219,36 @@ function UI.NewTab(title, icon)
 
 		-- ---- Keybind --------------------------------------------------
 		function sectionObj:Keybind(name, default, callback)
-			local row = makeRow(40, name)
+			local row = makeRow(42, name)
 			local current = default or "RightShift"
-			local nameLabel = label(row, name, 12, Theme.Text)
-			nameLabel.Position = UDim2.fromOffset(12, 0)
-			nameLabel.Size = UDim2.new(0.55, 0, 1, 0)
+			local nameLabel = label(row, name, 12, Theme.Text, Enum.Font.GothamMedium)
+			nameLabel.Position = UDim2.fromOffset(13, 0)
+			nameLabel.Size = UDim2.new(0.58, -12, 1, 0)
 
 			local bindBtn = Instance.new("TextButton")
-			bindBtn.Size = UDim2.new(0.35, -14, 1, -10)
-			bindBtn.Position = UDim2.new(0.65, 4, 0, 5)
-			bindBtn.BackgroundColor3 = Theme.ElementHi
+			bindBtn.Size = UDim2.new(0.36, -14, 0, 28)
+			bindBtn.Position = UDim2.new(0.64, 2, 0.5, -14)
+			bindBtn.BackgroundColor3 = Theme.BgAlt
 			bindBtn.Text = current
 			bindBtn.TextSize = 11
-			bindBtn.TextColor3 = Theme.Accent
+			bindBtn.TextColor3 = Theme.Gold
 			bindBtn.Font = Enum.Font.GothamBold
 			bindBtn.Parent = row
-			corner(bindBtn, 6)
+			corner(bindBtn, 7)
+			local ks = stroke(bindBtn, Theme.GoldDim, 1, 0.3)
 
 			local listening = false
 			bindBtn.MouseButton1Click:Connect(function()
 				listening = true
-				bindBtn.Text = "..."
+				bindBtn.Text = "Press key..."
+				tween(ks, { Color = Theme.Accent }, 0.15)
 				local conn
 				conn = UserInputService.InputBegan:Connect(function(input)
 					if listening and input.UserInputType == Enum.UserInputType.Keyboard then
 						current = input.KeyCode.Name
 						bindBtn.Text = current
 						listening = false
+						tween(ks, { Color = Theme.GoldDim }, 0.15)
 						conn:Disconnect()
 						if callback then fireCallback(callback, current) end
 					end
@@ -1405,31 +2262,34 @@ function UI.NewTab(title, icon)
 
 		-- ---- Paragraph / Live Stat -----------------------------------
 		function sectionObj:Paragraph(name, text)
-			local row = makeRow(46, name)
-			local nameLabel = label(row, name, 11, Theme.TextDim)
-			nameLabel.Position = UDim2.fromOffset(12, 3)
-			nameLabel.Size = UDim2.new(1, -24, 0, 16)
+			local row = makeRow(48, name)
+			local nameLabel = label(row, string.upper(tostring(name or "")), 10, Theme.TextDim, Enum.Font.GothamBold)
+			nameLabel.Position = UDim2.fromOffset(13, 5)
+			nameLabel.Size = UDim2.new(1, -26, 0, 14)
 
-			local bodyText = label(row, text or "", 12, Theme.Text, Enum.Font.GothamMedium)
-			bodyText.Position = UDim2.fromOffset(12, 21)
-			bodyText.Size = UDim2.new(1, -24, 0, 20)
+			local bodyText = label(row, text or "", 12, Theme.Text, Enum.Font.GothamBold)
+			bodyText.Position = UDim2.fromOffset(13, 22)
+			bodyText.Size = UDim2.new(1, -26, 0, 20)
 			bodyText.TextXAlignment = Enum.TextXAlignment.Left
 			bodyText.TextTruncate = Enum.TextTruncate.AtEnd
 
 			return {
 				Set = function(_, v) bodyText.Text = tostring(v) end,
 				Get = function() return bodyText.Text end,
+				SetColor = function(_, col) bodyText.TextColor3 = col or Theme.Text end,
 			}
 		end
 
-		-- ---- Label (plain text row) ----------------------------------
+		-- ---- Label (plain info banner) --------------------------------
 		function sectionObj:Label(text)
-			local row = makeRow(30, text)
-			row.BackgroundTransparency = 1
-			local l = label(row, text, 11, Theme.TextDim, Enum.Font.GothamMedium)
-			l.Position = UDim2.fromOffset(6, 0)
-			l.Size = UDim2.new(1, -12, 1, 0)
-			return { Set = function(_, v) l.Text = tostring(v) end }
+			local row, rs = makeRow(30, text)
+			row.BackgroundTransparency = 0.75
+			rs.Transparency = 0.8
+			local l = label(row, "ℹ  " .. tostring(text or ""), 11, Theme.TextDim, Enum.Font.GothamMedium)
+			l.Position = UDim2.fromOffset(10, 0)
+			l.Size = UDim2.new(1, -20, 1, 0)
+			l.TextTruncate = Enum.TextTruncate.AtEnd
+			return { Set = function(_, v) l.Text = "ℹ  " .. tostring(v) end }
 		end
 
 		table.insert(self.sections, sectionObj)
@@ -1442,7 +2302,9 @@ end
 
 -- ============================================================ SEARCH FILTER
 searchBox:GetPropertyChangedSignal("Text"):Connect(function()
-	local q = string.lower(searchBox.Text or "")
+	local raw = searchBox.Text or ""
+	searchClear.Visible = (#raw > 0)
+	local q = string.lower(raw)
 	for _, e in ipairs(UI._elements) do
 		if q == "" then
 			e.row.Visible = true
@@ -1454,8 +2316,9 @@ end)
 
 -- ============================================================ TOAST NOTIFY
 local toastHolder = Instance.new("Frame")
-toastHolder.Size = UDim2.fromOffset(300, 400)
-toastHolder.Position = UDim2.new(1, -316, 1, -416)
+toastHolder.Name = "ToastHolder"
+toastHolder.Size = UDim2.fromOffset(312, 420)
+toastHolder.Position = UDim2.new(1, -328, 1, -436)
 toastHolder.BackgroundTransparency = 1
 toastHolder.Parent = gui
 local toastList = Instance.new("UIListLayout")
@@ -1471,42 +2334,44 @@ Hub.Notify = function(title, text, kind)
 	toastCount = toastCount + 1
 	local color = Theme.Accent
 	if kind == "success" then color = Theme.Success
-	elseif kind == "warn" then color = Theme.Warning
+	elseif kind == "warn" then color = Theme.Gold
 	elseif kind == "error" then color = Theme.Danger
 	end
 
 	local toast = Instance.new("Frame")
-	toast.Size = UDim2.fromOffset(290, 64)
+	toast.Size = UDim2.fromOffset(304, 66)
 	toast.BackgroundColor3 = Theme.Panel
 	toast.BackgroundTransparency = 1
 	toast.BorderSizePixel = 0
 	toast.LayoutOrder = toastCount
 	toast.Parent = toastHolder
-	corner(toast, 10)
+	corner(toast, 11)
 	local s = stroke(toast, color, 1.2, 1)
 
 	local bar = Instance.new("Frame")
-	bar.Size = UDim2.new(0, 3, 1, -12)
-	bar.Position = UDim2.fromOffset(6, 6)
+	bar.Size = UDim2.new(0, 3, 1, -16)
+	bar.Position = UDim2.fromOffset(8, 8)
 	bar.BackgroundColor3 = color
+	bar.BorderSizePixel = 0
 	bar.Parent = toast
 	corner(bar, 100)
 
 	local t1 = label(toast, title or "MtiennDeptrai", 12, Theme.Text, Enum.Font.GothamBold)
-	t1.Position = UDim2.fromOffset(18, 6)
-	t1.Size = UDim2.new(1, -26, 0, 18)
-	local t2 = label(toast, text or "", 11, Theme.TextDim)
-	t2.Position = UDim2.fromOffset(18, 26)
-	t2.Size = UDim2.new(1, -26, 0, 30)
+	t1.Position = UDim2.fromOffset(20, 8)
+	t1.Size = UDim2.new(1, -28, 0, 18)
+	local t2 = label(toast, text or "", 11, Theme.TextDim, Enum.Font.Gotham)
+	t2.Position = UDim2.fromOffset(20, 28)
+	t2.Size = UDim2.new(1, -28, 0, 30)
 	t2.TextYAlignment = Enum.TextYAlignment.Top
+	t2.TextWrapped = true
 
-	tween(toast, { BackgroundTransparency = 0.05 }, 0.25)
-	tween(s, { Transparency = 0 }, 0.25)
+	tween(toast, { BackgroundTransparency = 0.04 }, 0.22)
+	tween(s, { Transparency = 0.15 }, 0.22)
 	task.delay(3.5, function()
-		tween(toast, { BackgroundTransparency = 1 }, 0.3)
-		tween(s, { Transparency = 1 }, 0.3)
-		task.wait(0.35)
-		toast:Destroy()
+		tween(toast, { BackgroundTransparency = 1 }, 0.28)
+		tween(s, { Transparency = 1 }, 0.28)
+		task.wait(0.32)
+		if toast.Parent then toast:Destroy() end
 	end)
 end
 UI.Notify = Hub.Notify
@@ -1538,7 +2403,7 @@ do
 	end)
 end
 
--- Dragging (ignore drags starting on the search box / window buttons)
+-- Dragging (ignore drags starting on search / window buttons)
 do
 	local dragging = false
 	local dragStart, startPos
@@ -1549,11 +2414,10 @@ do
 	end
 	titleBar.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			if pointIn(searchBox, input.Position) then return end
-			-- top-right window buttons reserve the last 90px
+			if pointIn(searchWrap, input.Position) then return end
 			local wpos = window.AbsolutePosition
 			local wsize = window.AbsoluteSize
-			if input.Position.X > (wpos.X + wsize.X - 90) then return end
+			if input.Position.X > (wpos.X + wsize.X - 96) then return end
 			dragging = true
 			dragStart = input.Position
 			startPos = window.Position
@@ -1577,47 +2441,55 @@ local minimized = false
 btnMinimize.MouseButton1Click:Connect(function()
 	minimized = not minimized
 	if minimized then
-		tween(window, { Size = UDim2.fromOffset(880, 56) }, 0.25)
+		tween(window, { Size = UDim2.fromOffset(WIN_W, 64) }, 0.24)
 	else
-		tween(window, { Size = UDim2.fromOffset(880, 580) }, 0.25)
+		tween(window, { Size = UDim2.fromOffset(WIN_W, WIN_H) }, 0.24)
 	end
 end)
 
--- Close (hide window; floating pill reopens)
+-- Close (hide window; floating VIP crest pill reopens)
 btnClose.MouseButton1Click:Connect(function()
 	window.Visible = false
-	Hub.Notify("MtiennDeptrai", "Hub hidden — mở lại bằng nút tròn góc trái dưới", "info")
+	Hub.Notify("MtiennDeptrai", "Hub đã ẩn — bấm nút logo tròn góc trái dưới hoặc " .. tostring(Config.UiKeybind) .. " để mở lại", "info")
 end)
 
--- ============================================================ FLOATING PILL
+-- ============================================================ FLOATING VIP PILL
 local pill = Instance.new("TextButton")
-pill.Size = UDim2.fromOffset(52, 52)
-pill.Position = UDim2.fromOffset(24, 24)
-pill.BackgroundColor3 = Theme.Accent
-pill.Text = "M"
-pill.TextSize = 22
-pill.TextColor3 = Theme.Text
-pill.Font = Enum.Font.GothamBlack
+pill.Name = "FloatingPill"
+pill.Size = UDim2.fromOffset(56, 56)
+pill.Position = UDim2.new(0, 22, 1, -78)
+pill.BackgroundColor3 = Theme.BgAlt
+pill.Text = ""
+pill.ClipsDescendants = true
+pill.Visible = false -- revealed with UI.Show(true) after splash
 pill.Parent = gui
-corner(pill, 26)
-stroke(pill, Theme.Accent2, 2)
-local pillGrad = Instance.new("UIGradient")
-pillGrad.Color = ColorSequence.new(Theme.Accent, Theme.Accent2)
-pillGrad.Rotation = 45
-pillGrad.Parent = pill
+corner(pill, 28)
+local pillStroke = stroke(pill, Theme.Gold, 2, 0.05)
+gradient(pillStroke, Theme.Gold, Theme.Accent, 45)
+gradient(pill, Color3.fromRGB(24, 34, 62), Theme.Bg, 45)
 UI.Pill = pill
 
-pill.MouseButton1Click:Connect(function()
-	window.Visible = not window.Visible
-end)
+local pillFallback = label(pill, "M", 24, Theme.Gold, Enum.Font.GothamBlack, Enum.TextXAlignment.Center)
+pillFallback.Size = UDim2.fromScale(1, 1)
 
--- pill drag
+local pillImg = Instance.new("ImageLabel")
+pillImg.Size = UDim2.fromScale(1, 1)
+pillImg.BackgroundTransparency = 1
+pillImg.ScaleType = Enum.ScaleType.Crop
+pillImg.Visible = false
+pillImg.Parent = pill
+corner(pillImg, 28)
+Hub.LoadLogoImage(pillImg, pillFallback)
+
+-- Pill drag with click-vs-drag distance threshold (< 6px = toggle window)
 do
 	local dragging = false
+	local draggedFar = false
 	local dragStart, startPos
 	pill.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			dragging = true
+			draggedFar = false
 			dragStart = input.Position
 			startPos = pill.Position
 		end
@@ -1630,9 +2502,14 @@ do
 	Hub.trackConnection(UserInputService.InputChanged:Connect(function(input)
 		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
 			local delta = input.Position - dragStart
+			if math.abs(delta.X) > 6 or math.abs(delta.Y) > 6 then draggedFar = true end
 			pill.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
 		end
 	end))
+	pill.MouseButton1Click:Connect(function()
+		if draggedFar then return end
+		window.Visible = not window.Visible
+	end)
 end
 
 -- ============================================================ KEYBIND TOGGLE
@@ -1641,6 +2518,7 @@ Hub.trackConnection(UserInputService.InputBegan:Connect(function(input, processe
 	if input.UserInputType == Enum.UserInputType.Keyboard then
 		if input.KeyCode.Name == (Config.UiKeybind or "RightShift") then
 			window.Visible = not window.Visible
+			pill.Visible = true
 		end
 	end
 end))
@@ -1656,7 +2534,9 @@ function UI.Destroy()
 end
 
 function UI.Show(v)
-	window.Visible = v and true or false
+	local show = v and true or false
+	window.Visible = show
+	pill.Visible = true
 end
 
 -- Open first tab by default after all tabs are created (see finalize part)
@@ -1664,33 +2544,46 @@ function UI.OpenDefaultTab()
 	if UI.Tabs[1] then switchTab(UI.Tabs[1]) end
 end
 
-Hub.Log("UI framework ready")
+Hub.Log("UI framework v2.0 Obsidian VIP ready")
 
 -- >>>>>>>>>> part_04_splash_dashboard.lua <<<<<<<<<<
 -- ============================================================================
--- PART 4: STEPLOADER SPLASH + DASHBOARD TAB
+-- PART 4: VIP LOGO SPLASH + 2-COLUMN KPI DASHBOARD TAB
 -- ============================================================================
 
--- ------------------------------------------------------------- Splash screen
+-- ------------------------------------------------------------- VIP Splash screen
 do
+	local dim = Instance.new("Frame")
+	dim.Name = "SplashDim"
+	dim.Size = UDim2.fromScale(1, 1)
+	dim.BackgroundColor3 = Color3.fromRGB(4, 6, 12)
+	dim.BackgroundTransparency = 1
+	dim.BorderSizePixel = 0
+	dim.ZIndex = 40
+	dim.Parent = gui
+
 	local splash = Instance.new("CanvasGroup")
 	splash.Name = "MtiennSplash"
 	splash.AnchorPoint = Vector2.new(0.5, 0.5)
 	splash.Position = UDim2.fromScale(0.5, 0.5)
-	splash.Size = UDim2.fromOffset(440, 320)
+	splash.Size = UDim2.fromOffset(464, 316)
 	splash.BackgroundColor3 = Theme.Bg
+	splash.BorderSizePixel = 0
 	splash.GroupTransparency = 1
-	splash.Parent = gui
-	corner(splash, 16)
-	stroke(splash, Theme.Stroke, 1.5)
-
-	local dim = Instance.new("Frame")
-	dim.Size = UDim2.fromScale(1, 1)
-	dim.BackgroundColor3 = Color3.new(0, 0, 0)
-	dim.BackgroundTransparency = 1
-	dim.Parent = gui
-	dim.ZIndex = 40
 	splash.ZIndex = 41
+	splash.Parent = gui
+	corner(splash, 18)
+	local spStroke = stroke(splash, Theme.Gold, 1.6, 0.2)
+	gradient(spStroke, Theme.Gold, Theme.Accent, 35)
+	gradient(splash, Color3.fromRGB(16, 21, 36), Theme.Bg, 100)
+
+	local topLine = Instance.new("Frame")
+	topLine.Size = UDim2.new(1, 0, 0, 3)
+	topLine.BackgroundColor3 = Color3.new(1, 1, 1)
+	topLine.BorderSizePixel = 0
+	topLine.ZIndex = 42
+	topLine.Parent = splash
+	gradient(topLine, Theme.Gold, Theme.Accent, 0)
 
 	local function stext(parent, txt, size, pos, w, color, font, align)
 		local l = Instance.new("TextLabel")
@@ -1707,107 +2600,155 @@ do
 		return l
 	end
 
+	-- 72x72 VIP Crest Logo
 	local logoBox = Instance.new("Frame")
-	logoBox.Size = UDim2.fromOffset(56, 56)
-	logoBox.Position = UDim2.fromOffset(28, 24)
-	logoBox.BackgroundColor3 = Theme.Accent
+	logoBox.Size = UDim2.fromOffset(72, 72)
+	logoBox.Position = UDim2.fromOffset(26, 24)
+	logoBox.BackgroundColor3 = Theme.Element
+	logoBox.ClipsDescendants = true
 	logoBox.ZIndex = 42
 	logoBox.Parent = splash
-	corner(logoBox, 14)
-	local lg = Instance.new("UIGradient")
-	lg.Color = ColorSequence.new(Theme.Accent, Theme.Accent2)
-	lg.Rotation = 45
-	lg.Parent = logoBox
-	local lgt = stext(logoBox, "M", 30, UDim2.fromOffset(0, 8), 56, Theme.Text, Enum.Font.GothamBlack, Enum.TextXAlignment.Center)
+	corner(logoBox, 16)
+	local lStroke = stroke(logoBox, Theme.Gold, 1.6, 0.1)
+	gradient(lStroke, Theme.Gold, Theme.Accent, 45)
+	gradient(logoBox, Color3.fromRGB(26, 36, 66), Theme.BgAlt, 45)
 
-	stext(splash, Hub.Name, 19, UDim2.fromOffset(100, 28), 260, Theme.Text, Enum.Font.GothamBold)
-	stext(splash, "Anime Adventures  •  v" .. Hub.Version, 12, UDim2.fromOffset(100, 56), 260, Theme.TextDim)
+	local lgt = stext(logoBox, "M", 36, UDim2.fromOffset(0, 14), 72, Theme.Gold, Enum.Font.GothamBlack, Enum.TextXAlignment.Center)
+	local splashLogoImg = Instance.new("ImageLabel")
+	splashLogoImg.Size = UDim2.fromScale(1, 1)
+	splashLogoImg.BackgroundTransparency = 1
+	splashLogoImg.ScaleType = Enum.ScaleType.Crop
+	splashLogoImg.Visible = false
+	splashLogoImg.ZIndex = 43
+	splashLogoImg.Parent = logoBox
+	corner(splashLogoImg, 16)
+	Hub.LoadLogoImage(splashLogoImg, lgt)
 
-	-- progress bar
-	local track = Instance.new("Frame")
-	track.Size = UDim2.new(1, -56, 0, 6)
-	track.Position = UDim2.fromOffset(28, 232)
-	track.BackgroundColor3 = Theme.Element
-	track.ZIndex = 42
-	track.Parent = splash
-	corner(track, 100)
-	local fill = Instance.new("Frame")
-	fill.Size = UDim2.fromScale(0, 1)
-	fill.BackgroundColor3 = Theme.Accent
-	fill.ZIndex = 43
-	fill.Parent = track
-	corner(fill, 100)
-	local fg = Instance.new("UIGradient")
-	fg.Color = ColorSequence.new(Theme.Accent, Theme.Accent2)
-	fg.Parent = fill
+	stext(splash, Hub.Name, 20, UDim2.fromOffset(114, 28), 240, Theme.Text, Enum.Font.GothamBlack)
 
-	-- step rows
-	local stepNames = { "Environment", "GameData", "Modules", "UI Ready" }
+	local spVip = Instance.new("Frame")
+	spVip.Size = UDim2.fromOffset(42, 18)
+	spVip.Position = UDim2.fromOffset(312, 33)
+	spVip.BackgroundColor3 = Theme.Gold
+	spVip.BorderSizePixel = 0
+	spVip.ZIndex = 42
+	spVip.Parent = splash
+	corner(spVip, 5)
+	gradient(spVip, Theme.Gold, Color3.fromRGB(255, 224, 130), 0)
+	stext(spVip, "VIP", 10, UDim2.fromOffset(0, 0), 42, Theme.Bg, Enum.Font.GothamBlack, Enum.TextXAlignment.Center)
+
+	stext(splash, "Anime Adventures  •  v" .. Hub.Version .. "  •  Obsidian Royal", 11, UDim2.fromOffset(114, 57), 310, Theme.TextDim, Enum.Font.GothamMedium)
+	stext(splash, "Smart Defense  •  Zero-Lag Engines  •  Macro Suite", 11, UDim2.fromOffset(114, 76), 310, Theme.Accent, Enum.Font.GothamMedium)
+
+	-- Step checklist container
+	local listCard = Instance.new("Frame")
+	listCard.Size = UDim2.new(1, -52, 0, 118)
+	listCard.Position = UDim2.fromOffset(26, 112)
+	listCard.BackgroundColor3 = Theme.Panel
+	listCard.BackgroundTransparency = 0.2
+	listCard.BorderSizePixel = 0
+	listCard.ZIndex = 42
+	listCard.Parent = splash
+	corner(listCard, 12)
+	stroke(listCard, Theme.Stroke, 1)
+
+	local stepNames = {
+		"Executor Environment & Custom Assets",
+		"Anime Adventures GameData & Waypoints",
+		"Smart Auto-Place & Upgrade Engines",
+		"Obsidian Royal VIP Interface Ready",
+	}
 	local stepLabels = {}
 	for i, sName in ipairs(stepNames) do
 		local row = Instance.new("Frame")
-		row.Size = UDim2.new(1, -56, 0, 22)
-		row.Position = UDim2.fromOffset(28, 100 + (i - 1) * 26)
+		row.Size = UDim2.new(1, -24, 0, 22)
+		row.Position = UDim2.fromOffset(12, 10 + (i - 1) * 25)
 		row.BackgroundTransparency = 1
-		row.ZIndex = 42
-		row.Parent = splash
+		row.ZIndex = 43
+		row.Parent = listCard
 
 		local dot = Instance.new("Frame")
-		dot.Size = UDim2.fromOffset(10, 10)
-		dot.Position = UDim2.fromOffset(2, 6)
+		dot.Size = UDim2.fromOffset(9, 9)
+		dot.Position = UDim2.fromOffset(2, 7)
 		dot.BackgroundColor3 = Theme.ElementHi
-		dot.ZIndex = 43
+		dot.BorderSizePixel = 0
+		dot.ZIndex = 44
 		dot.Parent = row
 		corner(dot, 100)
 
-		local t = stext(row, sName, 12, UDim2.fromOffset(24, 0), 220, Theme.TextDim)
-		local mark = stext(row, "", 12, UDim2.new(1, -30, 0, 0), 26, Theme.Success, Enum.Font.GothamBold, Enum.TextXAlignment.Right)
+		local t = stext(row, sName, 11, UDim2.fromOffset(22, 1), 320, Theme.TextDim, Enum.Font.GothamMedium)
+		t.ZIndex = 44
+		local mark = stext(row, "", 12, UDim2.new(1, -28, 0, 0), 24, Theme.Success, Enum.Font.GothamBlack, Enum.TextXAlignment.Right)
+		mark.ZIndex = 44
 		stepLabels[i] = { text = t, dot = dot, mark = mark }
 	end
 
-	-- skip / close button
+	-- Progress bar
+	local track = Instance.new("Frame")
+	track.Size = UDim2.new(1, -52, 0, 7)
+	track.Position = UDim2.fromOffset(26, 250)
+	track.BackgroundColor3 = Theme.Element
+	track.BorderSizePixel = 0
+	track.ZIndex = 42
+	track.Parent = splash
+	corner(track, 100)
+
+	local fill = Instance.new("Frame")
+	fill.Size = UDim2.fromScale(0, 1)
+	fill.BackgroundColor3 = Color3.new(1, 1, 1)
+	fill.BorderSizePixel = 0
+	fill.ZIndex = 43
+	fill.Parent = track
+	corner(fill, 100)
+	gradient(fill, Theme.Gold, Theme.Accent, 0)
+
+	local footTxt = stext(splash, "Initializing VIP Hub...", 11, UDim2.fromOffset(26, 268), 320, Theme.TextDim, Enum.Font.Gotham)
+
+	-- Instant skip button
 	local skip = Instance.new("TextButton")
 	skip.Size = UDim2.fromOffset(30, 30)
-	skip.Position = UDim2.new(1, -40, 0, 10)
-	skip.BackgroundTransparency = 1
+	skip.Position = UDim2.new(1, -40, 0, 12)
+	skip.BackgroundColor3 = Theme.Element
+	skip.BackgroundTransparency = 0.4
 	skip.Text = "✕"
-	skip.TextSize = 16
+	skip.TextSize = 13
 	skip.TextColor3 = Theme.TextDim
 	skip.Font = Enum.Font.GothamBold
-	skip.ZIndex = 43
+	skip.ZIndex = 44
 	skip.Parent = splash
+	corner(skip, 8)
 
 	local done = false
 	local function finish()
 		if done then return end
 		done = true
-		tween(splash, { GroupTransparency = 1 }, 0.35)
-		tween(dim, { BackgroundTransparency = 1 }, 0.35)
-		task.wait(0.4)
-		splash:Destroy()
-		dim:Destroy()
+		tween(splash, { GroupTransparency = 1 }, 0.25)
+		tween(dim, { BackgroundTransparency = 1 }, 0.25)
+		task.wait(0.28)
+		if splash.Parent then splash:Destroy() end
+		if dim.Parent then dim:Destroy() end
 		UI.Show(true)
 	end
 	skip.MouseButton1Click:Connect(finish)
 
 	task.spawn(function()
-		tween(splash, { GroupTransparency = 0 }, 0.3)
-		tween(dim, { BackgroundTransparency = 0.45 }, 0.3)
-		local durations = { 0.35, 0.45, 0.55, 0.35 }
-		local elapsed = 0
+		tween(splash, { GroupTransparency = 0 }, 0.24)
+		tween(dim, { BackgroundTransparency = 0.45 }, 0.24)
+		local durations = { 0.22, 0.28, 0.30, 0.22 }
 		for i = 1, 4 do
 			if done then return end
 			local s = stepLabels[i]
 			s.text.TextColor3 = Theme.Text
-			tween(s.dot, { BackgroundColor3 = Theme.Accent }, 0.15)
-			tween(fill, { Size = UDim2.fromScale((i - 0.2) / 4, 1) }, durations[i])
+			footTxt.Text = "Loading: " .. stepNames[i] .. "..."
+			tween(s.dot, { BackgroundColor3 = Theme.Gold }, 0.14)
+			tween(fill, { Size = UDim2.fromScale((i - 0.15) / 4, 1) }, durations[i])
 			task.wait(durations[i])
-			tween(s.dot, { BackgroundColor3 = Theme.Success }, 0.15)
+			tween(s.dot, { BackgroundColor3 = Theme.Success }, 0.14)
 			s.mark.Text = "✓"
-			elapsed = elapsed + durations[i]
 		end
-		tween(fill, { Size = UDim2.fromScale(1, 1) }, 0.2)
-		task.wait(0.35)
+		footTxt.Text = "Ready — launching MtiennDeptrai Hub!"
+		tween(fill, { Size = UDim2.fromScale(1, 1) }, 0.16)
+		task.wait(0.24)
 		finish()
 	end)
 end
@@ -1816,54 +2757,117 @@ end
 local Dash = UI.NewTab("Dashboard", "◈")
 Hub.DashboardTab = Dash
 
--- Live stats section
-local statSec = Dash:Section("Live Stats")
-local statMode    = statSec:Paragraph("Mode", "Lobby")
-local statMap     = statSec:Paragraph("Map / Area", "-")
-local statWave    = statSec:Paragraph("Wave", "0")
-local statYen     = statSec:Paragraph("Yen (In-Match)", "0")
-local statGems    = statSec:Paragraph("Gems", "0")
-local statGold    = statSec:Paragraph("Gold", "0")
-local statTroph   = statSec:Paragraph("Trophies", "0")
-local statXP      = statSec:Paragraph("Player XP", "0")
-local statPerf    = statSec:Paragraph("FPS / Uptime", "-")
-local statPing    = statSec:Paragraph("Ping", "-")
+-- 2-Column KPI Card Grid
+local statSec = Dash:Section("Live Overview")
+local kpiWrap = statSec:CustomFrame(238, "mode map wave yen gems gold trophies xp fps ping uptime")
+local kpiGrid = Instance.new("UIGridLayout")
+kpiGrid.CellSize = UDim2.new(0.5, -5, 0, 54)
+kpiGrid.CellPadding = UDim2.fromOffset(10, 8)
+kpiGrid.SortOrder = Enum.SortOrder.LayoutOrder
+kpiGrid.Parent = kpiWrap
 
--- Quick controls
+local function makeKpiCard(order, title, initVal, accentCol)
+	local card = Instance.new("Frame")
+	card.BackgroundColor3 = Theme.Element
+	card.BackgroundTransparency = 0.08
+	card.BorderSizePixel = 0
+	card.LayoutOrder = order
+	card.Parent = kpiWrap
+	corner(card, 10)
+	stroke(card, Theme.Stroke, 1, 0.35)
+
+	local bar = Instance.new("Frame")
+	bar.Size = UDim2.new(0, 3, 1, -18)
+	bar.Position = UDim2.fromOffset(9, 9)
+	bar.BackgroundColor3 = accentCol or Theme.Accent
+	bar.BorderSizePixel = 0
+	bar.Parent = card
+	corner(bar, 100)
+
+	local kTitle = label(card, string.upper(title), 10, Theme.TextDim, Enum.Font.GothamBold)
+	kTitle.Position = UDim2.fromOffset(20, 7)
+	kTitle.Size = UDim2.new(1, -26, 0, 14)
+
+	local kVal = label(card, initVal or "-", 14, Theme.Text, Enum.Font.GothamBlack)
+	kVal.Position = UDim2.fromOffset(20, 24)
+	kVal.Size = UDim2.new(1, -26, 0, 22)
+	kVal.TextTruncate = Enum.TextTruncate.AtEnd
+
+	return {
+		Set = function(_, v) kVal.Text = tostring(v) end,
+		SetColor = function(_, c) kVal.TextColor3 = c or Theme.Text end,
+	}
+end
+
+local statMode  = makeKpiCard(1, "Mode", "Lobby", Theme.Accent)
+local statMap   = makeKpiCard(2, "Map / Area", "-", Theme.Accent2)
+local statWave  = makeKpiCard(3, "Wave / Timer", "0", Theme.Gold)
+local statYen   = makeKpiCard(4, "Yen (In-Match)", "0", Theme.Success)
+local statGems  = makeKpiCard(5, "Gems", "0", Theme.Accent)
+local statGold  = makeKpiCard(6, "Gold", "0", Theme.Gold)
+local statTroph = makeKpiCard(7, "Trophies / XP", "0", Theme.Accent2)
+local statPerf  = makeKpiCard(8, "FPS • Ping • Uptime", "-", Theme.Success)
+
+-- Quick VIP Controls
 local quickSec = Dash:Section("Quick Controls")
-local quickFarmToggle
-quickFarmToggle = quickSec:Toggle("Quick Farm (Auto Vote + Skip + Upgrade + Loot)", false, function(v)
+local quickDefendToggle = quickSec:Toggle("⚡ Quick Smart-Defend (Auto Place + Smart Upgrade + Vote + Skip)", false, function(v)
+	Config.AutoPlace = v
+	Config.AutoUpgrade = v
+	Config.AutoVoteStart = v
+	Config.AutoSkipWave = v
+	Config.AutoLoot = v
+	if v and Config.UpgradeStrategy == "" then
+		Config.UpgradeStrategy = "Smart Economy"
+	end
+	if Hub.SyncAutoPlayToggles then Hub.SyncAutoPlayToggles() end
+	Hub.Notify("Smart-Defend", v and "Đã BẬT — Tự đặt thủ + Nâng cấp thông minh + Vote/Skip" or "Đã TẮT Smart-Defend", v and "success" or "info")
+end)
+local quickFarmToggle = quickSec:Toggle("⚔ Quick Farm (Auto Vote + Skip + Upgrade + Loot)", false, function(v)
 	Config.QuickFarm = v
 	Config.AutoVoteStart = v
 	Config.AutoSkipWave = v
 	Config.AutoUpgrade = v
 	Config.AutoLoot = v
-	-- keep the Auto Play tab toggles in sync when they are created later
 	if Hub.SyncAutoPlayToggles then Hub.SyncAutoPlayToggles() end
 	Hub.Notify("Quick Farm", v and "Đã BẬT — Auto Vote/Skip/Upgrade/Loot" or "Đã TẮT", v and "success" or "info")
 end)
-local quickAbilityToggle = quickSec:Toggle("Quick Auto Ability (Buff Chain)", false, function(v)
+local quickAbilityToggle = quickSec:Toggle("✨ Quick Auto Ability (Buff Chain)", false, function(v)
 	Config.AutoAbility = v
 	if Hub.SyncAutoPlayToggles then Hub.SyncAutoPlayToggles() end
 end)
-quickSec:Button("Teleport → Lobby", function()
+quickSec:Button("📍 Save Current Position → Defense Spot", function()
+	local ok, pos = pcall(function()
+		return LocalPlayer.Character and LocalPlayer.Character:GetPivot().Position
+	end)
+	if ok and pos then
+		Config.SavedGroundPos = { x = pos.X, y = pos.Y, z = pos.Z }
+		Config.PlaceZone = "Saved Spot (Tọa độ lưu)"
+		if Hub.UIRefs and Hub.UIRefs.placeZone then
+			safe(function() Hub.UIRefs.placeZone:Set(Config.PlaceZone) end)
+		end
+		Hub.Notify("Defense Spot", string.format("Đã lưu tọa độ thủ: %.1f, %.1f, %.1f", pos.X, pos.Y, pos.Z), "success")
+	else
+		Hub.Notify("Defense Spot", "Không đọc được vị trí nhân vật", "error")
+	end
+end, Theme.Gold)
+quickSec:Button("🏠 Teleport → Lobby", function()
 	GameAPI.invoke("teleport_back_to_lobby")
 	Hub.Notify("Teleport", "Đang quay về Lobby...", "info")
 end)
-quickSec:Button("Open Settings Tab", function()
+quickSec:Button("⚙ Open Settings Tab", function()
 	if Hub.OpenTab then Hub.OpenTab("Settings & Misc") end
 end)
 
 -- Engine status
 local engSec = Dash:Section("Engine Status")
-local engStatus = engSec:Paragraph("Engines", "All idle")
+local engStatus = engSec:Paragraph("Active Engines", "All idle")
 
 -- Dashboard live refresh (throttled to 2 Hz)
 do
 	local acc = 0
 	local fps = 60
 	local fpsAcc, fpsCount = 0, 0
-	Hub.trackHeartbeat(function() end) -- placeholder teardown (loop exits when Flags.Running false)
+	Hub.trackHeartbeat(function() end)
 	Hub.trackConnection(RunService.Heartbeat:Connect(function(dt)
 		if Hub.Flags and Hub.Flags.Running == false then return end
 		fpsAcc = fpsAcc + dt
@@ -1876,31 +2880,33 @@ do
 
 		safe(function()
 			local lobby = GameAPI.isInLobby()
-			statMode:Set(lobby and "🟢 Lobby" or "⚔ In-Match")
+			local wave = GameAPI.getWave()
+			local wtime = GameAPI.getWaveTime()
+			statMode:Set(lobby and "● Lobby" or "⚔ In-Match")
+			statMode:SetColor(lobby and Theme.Accent or Theme.Success)
 			statMap:Set(GameAPI.getArea())
-			statWave:Set(tostring(GameAPI.getWave()))
-			statYen:Set(fmt(GameAPI.getStat("resource")))
+			statWave:Set(wtime > 0 and (tostring(wave) .. "  (" .. math.floor(wtime) .. "s)") or tostring(wave))
+			statYen:Set("¥ " .. fmt(GameAPI.getStat("resource")))
 			statGems:Set(fmt(GameAPI.getStat("gem_amount")))
 			statGold:Set(fmt(GameAPI.getStat("gold_amount")))
-			statTroph:Set(fmt(GameAPI.getStat("trophies")))
-			statXP:Set(fmt(GameAPI.getStat("player_xp")))
+			statTroph:Set(fmt(GameAPI.getStat("trophies")) .. "  •  " .. fmt(GameAPI.getStat("player_xp")) .. " XP")
 
 			local ping = 0
 			pcall(function() ping = math.floor(LocalPlayer:GetNetworkPing() * 1000) end)
-			statPerf:Set(fps .. " FPS  •  " .. uptimeStr())
-			statPing:Set(ping .. " ms")
+			statPerf:Set(fps .. " FPS • " .. ping .. "ms • " .. uptimeStr())
 
-			-- engine status summary
 			local flags = Hub.Flags or {}
 			local parts = {}
-			if flags.InMatchRunning then table.insert(parts, "AutoPlay ▶") end
+			if Config.AutoPlace then table.insert(parts, "AutoPlace ▶") end
+			if Config.AutoUpgrade then table.insert(parts, "SmartUp ▶") end
+			if flags.InMatchRunning then table.insert(parts, "Match ▶") end
 			if flags.MacroPlaying then table.insert(parts, "Macro ▶") end
 			if flags.MacroRecording then table.insert(parts, "● REC") end
 			if flags.JoinRunning then table.insert(parts, "AutoJoin ▶") end
 			if flags.SummonRunning then table.insert(parts, "Summon ▶") end
 			if flags.RewardsRunning then table.insert(parts, "Rewards ▶") end
 			engStatus:Set(#parts > 0 and table.concat(parts, "  |  ") or "All idle")
-			UI.SetStatus(lobby and "In Lobby" or ("Wave " .. GameAPI.getWave()), lobby and Theme.Accent or Theme.Success)
+			UI.SetStatus(lobby and "In Lobby" or ("Wave " .. wave .. " • ¥" .. fmt(GameAPI.getStat("resource"))), lobby and Theme.Accent or Theme.Success)
 		end)
 	end))
 end
@@ -1916,11 +2922,11 @@ function Hub.OpenTab(title)
 	return false
 end
 
-Hub.Log("Splash + Dashboard ready")
+Hub.Log("VIP Splash + KPI Dashboard ready")
 
 -- >>>>>>>>>> part_05_engines_match.lua <<<<<<<<<<
 -- ============================================================================
--- PART 5: IN-MATCH ENGINE + MACRO ENGINE  (Tabs: Auto Play, Macro)
+-- PART 5: IN-MATCH SMART DEFENSE ENGINE + MACRO ENGINE (Tabs: Auto Play, Macro)
 -- ============================================================================
 
 Hub.Flags = {
@@ -1935,6 +2941,7 @@ Hub.Flags = {
 	_votedStart     = false,
 	_setDifficulty  = false,
 	_leftThisMatch  = false,
+	_soldFarms      = false,
 	_prioritized    = {},
 }
 local Flags = Hub.Flags
@@ -1952,12 +2959,66 @@ UIRefs.autoSkipWave = playSec:Toggle("Auto Skip Wave (Vote Skip)", Config.AutoSk
 UIRefs.autoDifficulty = playSec:Toggle("Auto Select Difficulty", Config.AutoDifficulty, function(v) Config.AutoDifficulty = v end)
 UIRefs.difficulty = playSec:Dropdown("Difficulty", { "Normal", "Hard", "Insane" }, Config.Difficulty, function(v) Config.Difficulty = v end)
 
-local upSec = AP:Section("Units")
+local placeSec = AP:Section("Smart Auto Place (Tự Đặt Thủ)")
+UIRefs.autoPlace = placeSec:Toggle("Enable Smart Auto Place", Config.AutoPlace, function(v) Config.AutoPlace = v end)
+UIRefs.placeZone = placeSec:Dropdown("Defense Position", {
+	"Mid Curve (Góc cua)",
+	"Spawn Camp (Đầu đường)",
+	"Base Guard (Thủ nhà)",
+	"Around Player (Quanh mình)",
+	"Saved Spot (Tọa độ lưu)",
+}, Config.PlaceZone, function(v) Config.PlaceZone = v end)
+UIRefs.placeSlots = placeSec:MultiDropdown("DPS / Defense Slots", { "1", "2", "3", "4", "5", "6" }, Config.PlaceSlots, function(v) Config.PlaceSlots = v end)
+UIRefs.farmSlots = placeSec:MultiDropdown("Farm / Money Slots", { "1", "2", "3", "4", "5", "6" }, Config.FarmSlots, function(v) Config.FarmSlots = v end)
+UIRefs.hillSlots = placeSec:MultiDropdown("Hill / Air Slots", { "1", "2", "3", "4", "5", "6" }, Config.HillSlots, function(v) Config.HillSlots = v end)
+UIRefs.maxUnitsPerSlot = placeSec:Slider("Max Units Per Slot", 1, 6, Config.MaxUnitsPerSlot, function(v) Config.MaxUnitsPerSlot = v end, 1)
+UIRefs.placeSpacing = placeSec:Slider("Spacing Between Units (studs)", 2.5, 10, Config.PlaceSpacing, function(v) Config.PlaceSpacing = v end, 0.5)
+UIRefs.placeRoadOffset = placeSec:Slider("Distance From Road (studs)", 5, 22, Config.PlaceRoadOffset, function(v) Config.PlaceRoadOffset = v end, 0.5)
+UIRefs.placeStartWave = placeSec:Slider("Start Placing At Wave", 0, 15, Config.PlaceStartWave, function(v) Config.PlaceStartWave = v end, 1)
+placeSec:Button("📍 Save Current Pos (Ground Defense)", function()
+	local ok, pos = pcall(function()
+		return LocalPlayer.Character and LocalPlayer.Character:GetPivot().Position
+	end)
+	if ok and pos then
+		Config.SavedGroundPos = { x = pos.X, y = pos.Y, z = pos.Z }
+		Config.PlaceZone = "Saved Spot (Tọa độ lưu)"
+		if UIRefs.placeZone then safe(function() UIRefs.placeZone:Set(Config.PlaceZone) end) end
+		Hub.Notify("Ground Spot", string.format("Đã lưu điểm thủ mặt đất: %.1f, %.1f, %.1f", pos.X, pos.Y, pos.Z), "success")
+	else
+		Hub.Notify("Ground Spot", "Không tìm thấy vị trí nhân vật", "error")
+	end
+end, Theme.Gold)
+placeSec:Button("⛰ Save Current Pos (Hill Defense)", function()
+	local ok, pos = pcall(function()
+		return LocalPlayer.Character and LocalPlayer.Character:GetPivot().Position
+	end)
+	if ok and pos then
+		Config.SavedHillPos = { x = pos.X, y = pos.Y, z = pos.Z }
+		Hub.Notify("Hill Spot", string.format("Đã lưu điểm thủ trên đồi: %.1f, %.1f, %.1f", pos.X, pos.Y, pos.Z), "success")
+	else
+		Hub.Notify("Hill Spot", "Không tìm thấy vị trí nhân vật", "error")
+	end
+end, Theme.Accent)
+local loadoutInfo = placeSec:Paragraph("Detected Hotbar Loadout", "Vào trận để tự nhận diện 6 ô nhân vật")
+placeSec:Label("Ưu tiên đặt 1 DPS trước để không lọt quái Wave 1 → Farm → Full team DPS")
+
+local upSec = AP:Section("Smart Auto Upgrade & Economy")
 UIRefs.autoUpgrade = upSec:Toggle("Auto Upgrade Units", Config.AutoUpgrade, function(v) Config.AutoUpgrade = v end)
-UIRefs.upgradeStrategy = upSec:Dropdown("Upgrade Strategy", { "Cheapest First", "Highest Cost", "Farm First", "All" }, Config.UpgradeStrategy, function(v) Config.UpgradeStrategy = v end)
+UIRefs.upgradeStrategy = upSec:Dropdown("Upgrade Strategy", {
+	"Smart Economy",
+	"Balanced Level",
+	"Carry First",
+	"Farm First",
+	"Cheapest First",
+	"Highest Cost",
+	"All",
+}, Config.UpgradeStrategy, function(v) Config.UpgradeStrategy = v end)
+UIRefs.maxUpgradeLevel = upSec:Slider("Max Upgrade Level (0 = Max)", 0, 15, Config.MaxUpgradeLevel, function(v) Config.MaxUpgradeLevel = v end, 1)
+UIRefs.reserveYen = upSec:Slider("Reserve Yen Before Upgrade", 0, 5000, Config.ReserveYen, function(v) Config.ReserveYen = v end, 100)
+UIRefs.autoSellFarmsWave = upSec:Slider("Auto Sell Farms At Wave (0 = Off)", 0, 50, Config.AutoSellFarmsWave, function(v) Config.AutoSellFarmsWave = v end, 1)
 UIRefs.autoPriority = upSec:Toggle("Auto Change Priority", Config.AutoPriority, function(v) Config.AutoPriority = v end)
 UIRefs.priorityMode = upSec:Dropdown("Priority Target", { "First", "Last", "Closest", "Strongest", "Weakest" }, Config.PriorityMode, function(v) Config.PriorityMode = v end)
-UIRefs.autoSellAtWave = upSec:Toggle("Auto Sell All at Wave X", Config.AutoLeaveAtWave, function(v) Config.AutoLeaveAtWave = v end)
+UIRefs.autoSellAtWave = upSec:Toggle("Auto Sell/Leave At Wave X", Config.AutoLeaveAtWave, function(v) Config.AutoLeaveAtWave = v end)
 UIRefs.leaveWave = upSec:Slider("Sell/Leave Wave", 1, 100, Config.LeaveWave, function(v) Config.LeaveWave = v end)
 UIRefs.leaveAction = upSec:Dropdown("At Wave X Action", { "Vote Lose", "Teleport Lobby", "Sell All Units" }, Config.LeaveAction, function(v) Config.LeaveAction = v end)
 
@@ -1982,6 +3043,7 @@ endSec:Label("Replay = chơi lại màn | Next = màn kế | Lobby = về sảnh
 function Hub.SyncAutoPlayToggles()
 	safe(function() UIRefs.autoVoteStart:Set(Config.AutoVoteStart) end)
 	safe(function() UIRefs.autoSkipWave:Set(Config.AutoSkipWave) end)
+	safe(function() UIRefs.autoPlace:Set(Config.AutoPlace) end)
 	safe(function() UIRefs.autoUpgrade:Set(Config.AutoUpgrade) end)
 	safe(function() UIRefs.autoLoot:Set(Config.AutoLoot) end)
 	safe(function() UIRefs.autoAbility:Set(Config.AutoAbility) end)
@@ -1993,13 +3055,26 @@ Hub.Engines.InMatch = InMatch
 do
 	local lastAbilityTick = 0
 	local lastUpgradeTick = 0
-	local myUnitsCache = {}
+	local lastPlaceTick   = 0
+	local lastLoadoutTick = 0
+	local myUnitsCache    = {}
+	local waypointsCache  = nil
+	local placedBySlot    = {} -- fallback counter if placement_text isn't exposed
 
 	local function resetMatchState()
 		Flags._votedStart = false
 		Flags._setDifficulty = false
 		Flags._leftThisMatch = false
+		Flags._soldFarms = false
 		Flags._prioritized = {}
+		waypointsCache = nil
+		placedBySlot = {}
+	end
+
+	local function listToSet(arr)
+		local s = {}
+		for _, v in ipairs(arr or {}) do s[tostring(v)] = true end
+		return s
 	end
 
 	local function findNearestUnit(pos, maxDist)
@@ -2016,22 +3091,169 @@ do
 	end
 	InMatch.findNearestUnit = findNearestUnit
 
-	local function sortForUpgrade(units)
+	local function isFarmUnit(u)
+		return GameAPI.isFarmUnitName(u.name) or GameAPI.isFarmUnitName(u.id)
+	end
+
+	local function sortForUpgrade(units, wave)
+		local list = {}
+		local maxCap = Config.MaxUpgradeLevel or 0
+		for _, u in ipairs(units) do
+			if not GameAPI.isUnitMaxed(u.model) then
+				if maxCap <= 0 or (tonumber(u.upgrade) or 0) < maxCap then
+					table.insert(list, u)
+				end
+			end
+		end
+
 		local mode = Config.UpgradeStrategy
-		if mode == "Cheapest First" then
-			table.sort(units, function(a, b) return GameAPI.getUnitCost(a.model) < GameAPI.getUnitCost(b.model) end)
-		elseif mode == "Highest Cost" then
-			table.sort(units, function(a, b) return GameAPI.getUnitCost(a.model) > GameAPI.getUnitCost(b.model) end)
+		if mode == "Smart Economy" then
+			-- Count placed DPS units so we never starve defense on Wave 1-2
+			local dpsCount = 0
+			for _, u in ipairs(units) do
+				if not isFarmUnit(u) then dpsCount = dpsCount + 1 end
+			end
+			table.sort(list, function(a, b)
+				local aFarm = isFarmUnit(a)
+				local bFarm = isFarmUnit(b)
+				local aUp = tonumber(a.upgrade) or 0
+				local bUp = tonumber(b.upgrade) or 0
+				local aCost = GameAPI.getUnitCost(a.model)
+				local bCost = GameAPI.getUnitCost(b.model)
+
+				-- Wave < 10 and at least 1 DPS placed: boost farms up to lv 4 first
+				if dpsCount >= 1 and (wave or 0) < 10 then
+					local aEcoPrio = aFarm and aUp < 4
+					local bEcoPrio = bFarm and bUp < 4
+					if aEcoPrio ~= bEcoPrio then return aEcoPrio end
+				elseif (wave or 0) >= 10 then
+					-- Late game: prioritize DPS carries over farms
+					if aFarm ~= bFarm then return not aFarm end
+				end
+				if aUp ~= bUp then return aUp < bUp end
+				return aCost < bCost
+			end)
+		elseif mode == "Balanced Level" then
+			table.sort(list, function(a, b)
+				local aUp = tonumber(a.upgrade) or 0
+				local bUp = tonumber(b.upgrade) or 0
+				if aUp ~= bUp then return aUp < bUp end
+				return GameAPI.getUnitCost(a.model) < GameAPI.getUnitCost(b.model)
+			end)
+		elseif mode == "Carry First" then
+			table.sort(list, function(a, b)
+				local aFarm = isFarmUnit(a) and 1 or 0
+				local bFarm = isFarmUnit(b) and 1 or 0
+				if aFarm ~= bFarm then return aFarm < bFarm end
+				local aUp = tonumber(a.upgrade) or 0
+				local bUp = tonumber(b.upgrade) or 0
+				if aUp ~= bUp then return aUp < bUp end
+				return GameAPI.getUnitCost(a.model) > GameAPI.getUnitCost(b.model)
+			end)
 		elseif mode == "Farm First" then
-			table.sort(units, function(a, b)
-				local an = string.find(string.lower(a.name), "farm") and 0 or 1
-				local bn = string.find(string.lower(b.name), "farm") and 0 or 1
+			table.sort(list, function(a, b)
+				local an = isFarmUnit(a) and 0 or 1
+				local bn = isFarmUnit(b) and 0 or 1
 				if an == bn then return GameAPI.getUnitCost(a.model) < GameAPI.getUnitCost(b.model) end
 				return an < bn
 			end)
+		elseif mode == "Cheapest First" then
+			table.sort(list, function(a, b) return GameAPI.getUnitCost(a.model) < GameAPI.getUnitCost(b.model) end)
+		elseif mode == "Highest Cost" then
+			table.sort(list, function(a, b) return GameAPI.getUnitCost(a.model) > GameAPI.getUnitCost(b.model) end)
 		end
-		return units
+		return list
 	end
+	InMatch.sortForUpgrade = sortForUpgrade
+
+	local function trySmartPlace(wave, money)
+		local slots = GameAPI.getEquippedSlots()
+		if #slots == 0 then return false end
+
+		-- Refresh loadout preview every ~2s
+		if tick() - lastLoadoutTick > 2 then
+			lastLoadoutTick = tick()
+			local desc = {}
+			for _, s in ipairs(slots) do
+				table.insert(desc, "#" .. s.slot .. " " .. s.name .. (s.isFarm and "[F]" or "") .. " (" .. s.placed .. "/" .. s.maxPlace .. ")")
+			end
+			loadoutInfo:Set(table.concat(desc, " | "))
+		end
+
+		if wave < (Config.PlaceStartWave or 1) then return false end
+
+		local dpsSet  = listToSet(Config.PlaceSlots)
+		local farmSet = listToSet(Config.FarmSlots)
+		local hillSet = listToSet(Config.HillSlots)
+		local maxPer  = Config.MaxUnitsPerSlot or 3
+
+		local dpsOnField = 0
+		for _, u in ipairs(myUnitsCache) do
+			if not isFarmUnit(u) then dpsOnField = dpsOnField + 1 end
+		end
+
+		local dpsCandidates, farmCandidates = {}, {}
+		for _, s in ipairs(slots) do
+			local placed = math.max(s.placed or 0, placedBySlot[s.slot] or 0)
+			local cap = math.min(s.maxPlace or 4, maxPer)
+			if placed < cap and (s.cost or 0) <= money then
+				local isFarmSlot = farmSet[s.slot] or (s.isFarm and not dpsSet[s.slot] and not hillSet[s.slot])
+				local isHillSlot = hillSet[s.slot] == true
+				local isDpsSlot  = dpsSet[s.slot] or isHillSlot
+				if isFarmSlot then
+					table.insert(farmCandidates, { slot = s, placed = placed, isFarm = true, isHill = false })
+				elseif isDpsSlot then
+					table.insert(dpsCandidates, { slot = s, placed = placed, isFarm = false, isHill = isHillSlot })
+				end
+			end
+		end
+
+		-- Even placement across selected slots (fewest placed first, then slot index)
+		local function cmpCand(a, b)
+			if a.placed ~= b.placed then return a.placed < b.placed end
+			return a.slot.index < b.slot.index
+		end
+		table.sort(dpsCandidates, cmpCand)
+		table.sort(farmCandidates, cmpCand)
+
+		-- Defense-first priority: ensure >= 1 DPS unit before farms, then farms, then remaining DPS
+		local pick = nil
+		if dpsOnField == 0 and #dpsCandidates > 0 then
+			pick = dpsCandidates[1]
+		elseif #farmCandidates > 0 then
+			pick = farmCandidates[1]
+		elseif #dpsCandidates > 0 then
+			pick = dpsCandidates[1]
+		end
+		if not pick then return false end
+
+		if not waypointsCache or #waypointsCache == 0 then
+			waypointsCache = GameAPI.getPathWaypoints()
+		end
+
+		local savedPos = pick.isHill and (Config.SavedHillPos or Config.SavedGroundPos) or Config.SavedGroundPos
+		local anchor, pathDir = GameAPI.computeDefenseAnchor(Config.PlaceZone, savedPos)
+		if not anchor then return false end
+
+		local cf = GameAPI.findPlacementSpot(anchor, {
+			spacing       = Config.PlaceSpacing or 3.8,
+			roadOffset    = Config.PlaceRoadOffset or 8.5,
+			isHill        = pick.isHill,
+			isFarm        = pick.isFarm,
+			pathDir       = pathDir,
+			existingUnits = myUnitsCache,
+			waypoints     = waypointsCache,
+		})
+		if not cf then return false end
+
+		local okPlaced = GameAPI.placeUnit(pick.slot.uuid, cf)
+		if okPlaced then
+			placedBySlot[pick.slot.slot] = (placedBySlot[pick.slot.slot] or pick.slot.placed or 0) + 1
+			Hub.Log("AutoPlace: spawned " .. pick.slot.name .. " (slot #" .. pick.slot.slot .. ")")
+		end
+		return okPlaced
+	end
+	InMatch.trySmartPlace = trySmartPlace
 
 	local function tickMatch()
 		local lobby = GameAPI.isInLobby()
@@ -2041,11 +3263,12 @@ do
 		end
 
 		local wave = GameAPI.getWave()
+		local money = GameAPI.getStat("resource")
 
 		-- Auto vote start (match loaded, before first wave)
 		if Config.AutoVoteStart and not Flags._votedStart and wave <= 1 then
 			local okRes = GameAPI.invoke("vote_start", "Yes")
-			Flags._votedStart = true -- avoid spamming even on failure; retried next match
+			Flags._votedStart = true
 			if okRes ~= nil then Hub.Log("vote_start sent") end
 		end
 
@@ -2055,8 +3278,14 @@ do
 			Flags._setDifficulty = true
 		end
 
-		-- Unit cache refresh (2 Hz cadence is enough, loop runs ~4 Hz)
+		-- Unit cache refresh
 		myUnitsCache = GameAPI.getMyUnits()
+
+		-- Smart Auto Place (rate-limited by Config.PlaceDelay)
+		if Config.AutoPlace and tick() - lastPlaceTick >= (Config.PlaceDelay or 1.2) then
+			lastPlaceTick = tick()
+			trySmartPlace(wave, money)
+		end
 
 		-- Auto priority (once per unit)
 		if Config.AutoPriority then
@@ -2068,14 +3297,31 @@ do
 			end
 		end
 
-		-- Auto upgrade (rate-limited, one upgrade per tick)
+		-- Auto sell farms at wave X (boss wave cash-out)
+		local sellFarmsW = Config.AutoSellFarmsWave or 0
+		if sellFarmsW > 0 and not Flags._soldFarms and wave >= sellFarmsW then
+			Flags._soldFarms = true
+			local sold = 0
+			for _, u in ipairs(myUnitsCache) do
+				if isFarmUnit(u) then
+					GameAPI.invoke("sell_unit_ingame", u.model)
+					sold = sold + 1
+				end
+			end
+			if sold > 0 then
+				Hub.Notify("Auto Sell Farms", "Đã bán " .. sold .. " unit farm tại Wave " .. wave, "warn")
+			end
+		end
+
+		-- Smart Auto Upgrade (rate-limited, respects ReserveYen & MaxUpgradeLevel)
 		if Config.AutoUpgrade and tick() - lastUpgradeTick > 0.8 then
 			lastUpgradeTick = tick()
-			local units = sortForUpgrade(myUnitsCache)
-			local money = GameAPI.getStat("resource")
+			local units = sortForUpgrade(myUnitsCache, wave)
+			local reserve = Config.ReserveYen or 0
+			local spendable = math.max(0, money - reserve)
 			for _, u in ipairs(units) do
 				local cost = GameAPI.getUnitCost(u.model)
-				if cost == math.huge or cost <= money or Config.UpgradeStrategy == "All" then
+				if Config.UpgradeStrategy == "All" or cost == math.huge or cost <= spendable then
 					GameAPI.invoke("upgrade_unit_ingame", u.model)
 					break
 				end
@@ -2128,7 +3374,6 @@ do
 	Flags.InMatchRunning = true
 
 	-- ---- S2C listeners ----
-	-- Auto Skip Wave
 	GameAPI.onServerEvent("start_vote_wave_skip", function()
 		if Config.AutoSkipWave then
 			task.wait(0.5)
@@ -2136,7 +3381,6 @@ do
 		end
 	end)
 
-	-- Auto Roguelike card
 	GameAPI.onServerEvent("show_roguelike_options", function(options)
 		if not Config.AutoRoguelike then return end
 		local picks = Config.RoguelikePicks or {}
@@ -2162,7 +3406,6 @@ do
 		end
 	end)
 
-	-- Auto loot
 	GameAPI.onServerEvent("loot_spawned", function(loot)
 		if not Config.AutoLoot then return end
 		local lootId = loot
@@ -2172,7 +3415,6 @@ do
 		end
 	end)
 
-	-- End-game vote
 	GameAPI.onServerEvent("game_finished", function()
 		local action = Config.EndGameAction
 		if action == "Off" then return end
@@ -2320,7 +3562,6 @@ do
 		task.spawn(function()
 			for i, step in ipairs(steps) do
 				if not Flags.MacroPlaying or not Flags.Running then break end
-				-- wait conditions
 				if Config.MacroWaitMode == "Wave" or Config.MacroWaitMode == "Wave + Money" then
 					while Flags.MacroPlaying and GameAPI.getWave() < (step.wave or 0) do task.wait(0.5) end
 				end
@@ -2455,7 +3696,7 @@ do
 	end
 end
 
-Hub.Log("InMatch + Macro engines ready")
+Hub.Log("Smart InMatch + Macro engines ready")
 
 -- >>>>>>>>>> part_06_engines_lobby.lua <<<<<<<<<<
 -- ============================================================================
@@ -3048,7 +4289,7 @@ end
 function Hub.ApplyConfigToUI()
 	local map = {
 		autoVoteStart = "AutoVoteStart", autoSkipWave = "AutoSkipWave",
-		autoUpgrade = "AutoUpgrade", autoLoot = "AutoLoot", autoAbility = "AutoAbility",
+		autoPlace = "AutoPlace", autoUpgrade = "AutoUpgrade", autoLoot = "AutoLoot", autoAbility = "AutoAbility",
 		autoPriority = "AutoPriority", autoRoguelike = "AutoRoguelike",
 		autoDifficulty = "AutoDifficulty", autoSellAtWave = "AutoLeaveAtWave",
 		autoJoinMode = "AutoJoinMode", storyInfinite = "StoryInfinite", friendsOnly = "FriendsOnly",
@@ -3068,7 +4309,7 @@ function Hub.ApplyConfigToUI()
 		end
 	end
 	local setterMap = {
-		difficulty = "Difficulty", upgradeStrategy = "UpgradeStrategy", priorityMode = "PriorityMode",
+		difficulty = "Difficulty", placeZone = "PlaceZone", upgradeStrategy = "UpgradeStrategy", priorityMode = "PriorityMode",
 		leaveAction = "LeaveAction", endAction = "EndGameAction", macroWaitMode = "MacroWaitMode",
 		joinDifficulty = "JoinDifficulty", storyWorld = "StoryWorld", summonBanner = "SummonBanner",
 		summonCurrency = "SummonCurrency", summonCount = "SummonCount", uiKeybind = "UiKeybind",
@@ -3078,12 +4319,22 @@ function Hub.ApplyConfigToUI()
 			safe(function() UIRefs[ref]:Set(Config[key]) end)
 		end
 	end
+	if UIRefs.maxUnitsPerSlot and UIRefs.maxUnitsPerSlot.Set then safe(function() UIRefs.maxUnitsPerSlot:Set(Config.MaxUnitsPerSlot) end) end
+	if UIRefs.placeSpacing and UIRefs.placeSpacing.Set then safe(function() UIRefs.placeSpacing:Set(Config.PlaceSpacing) end) end
+	if UIRefs.placeRoadOffset and UIRefs.placeRoadOffset.Set then safe(function() UIRefs.placeRoadOffset:Set(Config.PlaceRoadOffset) end) end
+	if UIRefs.placeStartWave and UIRefs.placeStartWave.Set then safe(function() UIRefs.placeStartWave:Set(Config.PlaceStartWave) end) end
+	if UIRefs.maxUpgradeLevel and UIRefs.maxUpgradeLevel.Set then safe(function() UIRefs.maxUpgradeLevel:Set(Config.MaxUpgradeLevel) end) end
+	if UIRefs.reserveYen and UIRefs.reserveYen.Set then safe(function() UIRefs.reserveYen:Set(Config.ReserveYen) end) end
+	if UIRefs.autoSellFarmsWave and UIRefs.autoSellFarmsWave.Set then safe(function() UIRefs.autoSellFarmsWave:Set(Config.AutoSellFarmsWave) end) end
 	if UIRefs.leaveWave and UIRefs.leaveWave.Set then safe(function() UIRefs.leaveWave:Set(Config.LeaveWave) end) end
 	if UIRefs.abilityDelay and UIRefs.abilityDelay.Set then safe(function() UIRefs.abilityDelay:Set(Config.AbilityDelay) end) end
 	if UIRefs.infiniteRoom and UIRefs.infiniteRoom.Set then safe(function() UIRefs.infiniteRoom:Set(Config.InfiniteRoom) end) end
 	if UIRefs.joinRetryDelay and UIRefs.joinRetryDelay.Set then safe(function() UIRefs.joinRetryDelay:Set(Config.JoinRetryDelay) end) end
 	if UIRefs.storyAct and UIRefs.storyAct.Set then safe(function() UIRefs.storyAct:Set(Config.StoryAct) end) end
 	-- multi-dropdowns
+	if UIRefs.placeSlots and UIRefs.placeSlots.Set then safe(function() UIRefs.placeSlots:Set(Config.PlaceSlots) end) end
+	if UIRefs.farmSlots and UIRefs.farmSlots.Set then safe(function() UIRefs.farmSlots:Set(Config.FarmSlots) end) end
+	if UIRefs.hillSlots and UIRefs.hillSlots.Set then safe(function() UIRefs.hillSlots:Set(Config.HillSlots) end) end
 	if UIRefs.traitTargets and UIRefs.traitTargets.Set then safe(function() UIRefs.traitTargets:Set(Config.TraitTargets) end) end
 	if UIRefs.sellRarities and UIRefs.sellRarities.Set then safe(function() UIRefs.sellRarities:Set(Config.SellHatchedRarities) end) end
 	-- text inputs
