@@ -2256,8 +2256,10 @@ do
 		recCount:Set(tostring(#steps))
 	end
 
+	local ensureMacroCapture
 	function MacroEngine.startRecording()
 		if Flags.MacroRecording then return end
+		if ensureMacroCapture then ensureMacroCapture() end
 		Flags.MacroRecording = true
 		recordStart = tick()
 		MacroEngine.clear()
@@ -2361,8 +2363,7 @@ do
 		playStatus:Set("Stopped")
 	end
 
-	-- ---- Recording capture ----
-	-- Preferred: hook __namecall and observe real game calls (accurate args)
+	-- ---- Recording capture (lazy-installed on startRecording to avoid startup lag) ----
 	do
 		local tracked = {
 			spawn_unit = "spawn",
@@ -2371,10 +2372,9 @@ do
 			change_priority = "priority",
 			use_active_attack = "ability",
 		}
-		local function recordCall(method, args)
+		local function recordCall(remoteName, args)
 			if not Flags.MacroRecording then return end
-			local step = { type = tracked[method] }
-			-- best-effort arg mapping across call shapes
+			local step = { type = tracked[remoteName] }
 			for _, a in ipairs(args) do
 				if typeof(a) == "CFrame" then
 					step.pos = { x = a.Position.X, y = a.Position.Y, z = a.Position.Z }
@@ -2387,57 +2387,70 @@ do
 				elseif typeof(a) == "Vector3" then
 					step.pos = { x = a.X, y = a.Y, z = a.Z }
 				elseif type(a) == "string" then
-					if tracked[method] == "spawn" and not step.unit_id then step.unit_id = a
-					elseif tracked[method] == "priority" then step.priority = a end
-				elseif type(a) == "number" and tracked[method] == "spawn" and not step.unit_id then
+					if tracked[remoteName] == "spawn" and not step.unit_id then step.unit_id = a
+					elseif tracked[remoteName] == "priority" then step.priority = a end
+				elseif type(a) == "number" and tracked[remoteName] == "spawn" and not step.unit_id then
 					step.unit_id = tostring(a)
 				end
 			end
 			MacroEngine.addStep(step)
 		end
 
-		local hooked = false
-		safe(function()
-			if Env.hasHookMeta and Env.hasNamecall then
-				local mt = getrawmetatable(game)
-				local oldNamecall = mt.__namecall
-				hookmetamethod(game, "__namecall", function(self, ...)
-					local args = { ... }
-					local method
-					safe(function() method = getnamecallmethod() end)
-					if method and tracked[method] then
-						recordCall(method, args)
-					end
-					return oldNamecall(self, ...)
-				end)
-				hooked = true
-			end
-		end)
+		local captureInitialized = false
+		ensureMacroCapture = function()
+			if captureInitialized then return end
+			captureInitialized = true
 
-		if not hooked then
-			-- Fallback: poll unit folder and detect spawns (no arg fidelity for upgrade/etc.)
-			Hub.trackConnection(RunService.Heartbeat:Connect(function()
-				if not Flags.MacroRecording then return end
-				-- lightweight spawn detection
-				local unitsFolder = Workspace:FindFirstChild("_UNITS")
-				if not unitsFolder then return end
-				for _, model in ipairs(unitsFolder:GetChildren()) do
+			local hooked = false
+			safe(function()
+				if Env.hasHookMeta and Env.hasNamecall and type(getnamecallmethod) == "function" then
+					local oldNamecall
+					oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+						if not Flags.MacroRecording then
+							return oldNamecall(self, ...)
+						end
+						local method = getnamecallmethod()
+						if (method == "InvokeServer" or method == "FireServer") and typeof(self) == "Instance" then
+							local rname = self.Name
+							if tracked[rname] then
+								recordCall(rname, { ... })
+							end
+						elseif method and tracked[method] then
+							recordCall(method, { ... })
+						end
+						return oldNamecall(self, ...)
+					end)
+					hooked = (oldNamecall ~= nil)
+				end
+			end)
+
+			if not hooked then
+				local recAcc = 0
+				Hub.trackConnection(RunService.Heartbeat:Connect(function(dt)
+					if not Flags.MacroRecording then return end
+					recAcc = recAcc + dt
+					if recAcc < 0.25 then return end
+					recAcc = 0
+					local unitsFolder = Workspace:FindFirstChild("_UNITS")
+					if not unitsFolder then return end
 					if not Flags._macroSeen then Flags._macroSeen = {} end
-					if not Flags._macroSeen[model] then
-						Flags._macroSeen[model] = true
-						local stats = model:FindFirstChild("_stats")
-						if stats then
-							local cf = GameAPI.getUnitPosition(model)
-							MacroEngine.addStep({
-								type = "spawn",
-								unit_id = (stats:FindFirstChild("id") and tostring(stats.id.Value)) or model.Name,
-								pos = cf and { x = cf.Position.X, y = cf.Position.Y, z = cf.Position.Z } or nil,
-							})
+					for _, model in ipairs(unitsFolder:GetChildren()) do
+						if not Flags._macroSeen[model] then
+							Flags._macroSeen[model] = true
+							local stats = model:FindFirstChild("_stats")
+							if stats then
+								local cf = GameAPI.getUnitPosition(model)
+								MacroEngine.addStep({
+									type = "spawn",
+									unit_id = (stats:FindFirstChild("id") and tostring(stats.id.Value)) or model.Name,
+									pos = cf and { x = cf.Position.X, y = cf.Position.Y, z = cf.Position.Z } or nil,
+								})
+							end
 						end
 					end
-				end
-			end))
-			Hub.Log("Macro recorder: namecall hook unavailable, using spawn detection fallback")
+				end))
+				Hub.Log("Macro recorder: namecall hook unavailable, using spawn detection fallback")
+			end
 		end
 	end
 end
